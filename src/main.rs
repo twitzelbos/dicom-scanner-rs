@@ -1,28 +1,24 @@
 use std::{
-    fs::File,
-    io::{Cursor, Read, Seek},
+    io::{Cursor, Read},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use dicom::object::{DicomObject, mem::InMemDicomObject};
+use dicom::object::mem::InMemDicomObject;
 use dicom::{
     core::Tag,
-    dictionary_std::tags::{CONTENT_QUALIFICATION, MRFOV_GEOMETRY_SEQUENCE, RESONANT_NUCLEUS},
+    dictionary_std::tags::{self, PATIENT_ID},
 };
 
 use dicom::object::StandardDataDictionary;
-use rayon::{prelude::*, slice};
+use rayon::prelude::*;
 use zip::ZipArchive;
 
 use clap::Parser;
-use std::path::PathBuf;
 
-use dicom::dictionary_std::tags::{self, RESPIRATORY_INTERVAL_TIME};
-use dicom::dictionary_std::tags::{BITS_ALLOCATED, SCANNING_SEQUENCE, PATIENT_ID};
-use dicom::object::{FileDicomObject, open_file};
-use dicom::{core::DataElement, object::OpenFileOptions};
+use dicom::object::OpenFileOptions;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -172,83 +168,82 @@ fn get_element_str(obj: &impl dicom::object::DicomObject, tag: Tag) -> Option<St
 }
 */
 
-fn get_element_value(obj: &InMemDicomObject<StandardDataDictionary>, tag: Tag) -> Option<String> {
-    obj.element(tag).ok()?.to_str().ok().map(|s| s.to_string())
-}
-
-pub fn scan_gems_parm_01(dcm_object: &InMemDicomObject<StandardDataDictionary>, suppress_output: bool) {
+pub fn scan_gems_parm_01(
+    dcm_object: &InMemDicomObject<StandardDataDictionary>,
+    suppress_output: bool,
+) {
     // VR: LO
-    let gehc_private_creator_ID = dcm_object
+    let gehc_private_creator_id = dcm_object
         .element(Tag(0x0043, 0x0010))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let bitmap_of_prescan_options = dcm_object
+    let _bitmap_of_prescan_options = dcm_object
         .element(Tag(0x0043, 0x1001))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let gradient_offset_x = dcm_object
+    let _gradient_offset_x = dcm_object
         .element(Tag(0x0043, 0x1002))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let gradient_offset_y = dcm_object
+    let _gradient_offset_y = dcm_object
         .element(Tag(0x0043, 0x1003))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let gradient_offset_z = dcm_object
+    let _gradient_offset_z = dcm_object
         .element(Tag(0x0043, 0x1004))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS, no longer used in DV26
-    let image_is_original = dcm_object
+    let _image_is_original = dcm_object
         .element(Tag(0x0043, 0x1005))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let number_of_epi_shots = dcm_object
+    let _number_of_epi_shots = dcm_object
         .element(Tag(0x0043, 0x1006))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let views_per_segment = dcm_object
+    let _views_per_segment = dcm_object
         .element(Tag(0x0043, 0x1007))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let respiratory_rate_bpm = dcm_object
+    let _respiratory_rate_bpm = dcm_object
         .element(Tag(0x0043, 0x1008))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let respiratory_trigger_point = dcm_object
+    let _respiratory_trigger_point = dcm_object
         .element(Tag(0x0043, 0x1009))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let type_of_receiver_used = dcm_object
+    let _type_of_receiver_used = dcm_object
         .element(Tag(0x0043, 0x100A))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
@@ -276,7 +271,7 @@ pub fn scan_gems_parm_01(dcm_object: &InMemDicomObject<StandardDataDictionary>, 
         });
 
     // VR: DS
-    let psd_estimated_limit_Tps = dcm_object
+    let psd_estimated_limit_tps = dcm_object
         .element(Tag(0x0043, 0x100E))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
@@ -290,56 +285,56 @@ pub fn scan_gems_parm_01(dcm_object: &InMemDicomObject<StandardDataDictionary>, 
         });
 
     // VR: US, no longer used in DV26
-    let window_value = dcm_object
+    let _window_value = dcm_object
         .element(Tag(0x0043, 0x1010))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let GE_image_integrity = dcm_object
+    let _ge_image_integrity = dcm_object
         .element(Tag(0x0043, 0x101C))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS, no longer used in DV26
-    let level_value = dcm_object
+    let _level_value = dcm_object
         .element(Tag(0x0043, 0x101D))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB, no longer used in DV26
-    let unique_image_identifier = dcm_object
+    let _unique_image_identifier = dcm_object
         .element(Tag(0x0043, 0x1028))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let histogram_tables = dcm_object
+    let _histogram_tables = dcm_object
         .element(Tag(0x0043, 0x1029))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let user_defined_data = dcm_object
+    let _user_defined_data = dcm_object
         .element(Tag(0x0043, 0x102A))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS[4], no longer used in DV26
-    let private_scan_options = dcm_object
+    let _private_scan_options = dcm_object
         .element(Tag(0x0043, 0x102B))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let effective_echo_spacing = dcm_object
+    let _effective_echo_spacing = dcm_object
         .element(Tag(0x0043, 0x102C))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
@@ -347,105 +342,105 @@ pub fn scan_gems_parm_01(dcm_object: &InMemDicomObject<StandardDataDictionary>, 
 
     // VR: SH
     // (String slop field 1 in legacy GE MR images)
-    let filter_mode = dcm_object
+    let _filter_mode = dcm_object
         .element(Tag(0x0043, 0x102D))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SH
-    let string_slop_field_2 = dcm_object
+    let _string_slop_field_2 = dcm_object
         .element(Tag(0x0043, 0x102E))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS (image_type)
-    let raw_data_type = dcm_object
+    let _raw_data_type = dcm_object
         .element(Tag(0x0043, 0x102F))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let vas_collapse_flag = dcm_object
+    let _vas_collapse_flag = dcm_object
         .element(Tag(0x0043, 0x1030))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[2], not used in DV26
-    let ra_coord_of_target_recon_center = dcm_object
+    let _ra_coord_of_target_recon_center = dcm_object
         .element(Tag(0x0043, 0x1031))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let vas_flags = dcm_object
+    let _vas_flags = dcm_object
         .element(Tag(0x0043, 0x1032))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: FL
-    let neg_scanspacing = dcm_object
+    let _neg_scanspacing = dcm_object
         .element(Tag(0x0043, 0x1033))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: IS
-    let offset_frequency = dcm_object
+    let _offset_frequency = dcm_object
         .element(Tag(0x0043, 0x1034))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UL
-    let user_usage_tag = dcm_object
+    let _user_usage_tag = dcm_object
         .element(Tag(0x0043, 0x1035))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UL
-    let user_fill_map_MSW = dcm_object
+    let _user_fill_map_msw = dcm_object
         .element(Tag(0x0043, 0x1036))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UL
-    let user_fill_map_LSW = dcm_object
+    let _user_fill_map_lsw = dcm_object
         .element(Tag(0x0043, 0x1037))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: FL[24]
-    let user_data25_48 = dcm_object
+    let _user_data25_48 = dcm_object
         .element(Tag(0x0043, 0x1038))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: IS[4]
-    let slop_int_6_9 = dcm_object
+    let _slop_int_6_9 = dcm_object
         .element(Tag(0x0043, 0x1039))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: IS[8]
-    let slop_int_10_17 = dcm_object
+    let _slop_int_10_17 = dcm_object
         .element(Tag(0x0043, 0x1060))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SH, not used in DV26
-    let scanner_study_id = dcm_object
+    let _scanner_study_id = dcm_object
         .element(Tag(0x0043, 0x1062))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
@@ -453,546 +448,546 @@ pub fn scan_gems_parm_01(dcm_object: &InMemDicomObject<StandardDataDictionary>, 
 
     // VS: DS[3 or 4]
     // 3 on single gradient coil systems, on multiple gradient coil systems the 4th value is the selected gradient coil
-    let scanner_table_entry = dcm_object
+    let _scanner_table_entry = dcm_object
         .element(Tag(0x0043, 0x106f))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: ST
-    let paradigm_description = dcm_object
+    let _paradigm_description = dcm_object
         .element(Tag(0x0043, 0x1071))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UI
-    let paradigm_uid = dcm_object
+    let _paradigm_uid = dcm_object
         .element(Tag(0x0043, 0x1072))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let experiment_type = dcm_object
+    let _experiment_type = dcm_object
         .element(Tag(0x0043, 0x1073))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let number_of_rest_volumes = dcm_object
+    let _number_of_rest_volumes = dcm_object
         .element(Tag(0x0043, 0x1074))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let number_of_active_volumes = dcm_object
+    let _number_of_active_volumes = dcm_object
         .element(Tag(0x0043, 0x1075))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let number_of_dummy_scans = dcm_object
+    let _number_of_dummy_scans = dcm_object
         .element(Tag(0x0043, 0x1076))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SH
-    let application_name = dcm_object
+    let _application_name = dcm_object
         .element(Tag(0x0043, 0x1077))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SH
-    let application_version = dcm_object
+    let _application_version = dcm_object
         .element(Tag(0x0043, 0x1078))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let slices_per_volume = dcm_object
+    let _slices_per_volume = dcm_object
         .element(Tag(0x0043, 0x1079))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let expected_time_points = dcm_object
+    let _expected_time_points = dcm_object
         .element(Tag(0x0043, 0x107A))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: FL[1...n]
-    let regressor_values = dcm_object
+    let _regressor_values = dcm_object
         .element(Tag(0x0043, 0x107B))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: FL
-    let delay_after_slice_group = dcm_object
+    let _delay_after_slice_group = dcm_object
         .element(Tag(0x0043, 0x107C))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: US
-    let recon_mode_flag_word = dcm_object
+    let _recon_mode_flag_word = dcm_object
         .element(Tag(0x0043, 0x107D))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1...n]
-    let pacc_specific_information = dcm_object
+    let _pacc_specific_information = dcm_object
         .element(Tag(0x0043, 0x107E))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1...n]
-    let private_data = dcm_object
+    let _private_data = dcm_object
         .element(Tag(0x0043, 0x107F))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1...n]
-    let coil_ID_data = dcm_object
+    let _coil_id_data = dcm_object
         .element(Tag(0x0043, 0x1080))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let GE_coil_name = dcm_object
+    let _ge_coil_name = dcm_object
         .element(Tag(0x0043, 0x1081))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1...n]
-    let system_configuration_information = dcm_object
+    let _system_configuration_information = dcm_object
         .element(Tag(0x0043, 0x1082))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[2]
-    let asset_R_factors = dcm_object
+    let _asset_r_factors = dcm_object
         .element(Tag(0x0043, 0x1083))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[5]
-    let additional_asset_data = dcm_object
+    let _additional_asset_data = dcm_object
         .element(Tag(0x0043, 0x1084))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UT
-    let debug_data_text = dcm_object
+    let _debug_data_text = dcm_object
         .element(Tag(0x0043, 0x1085))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let debug_data_bin = dcm_object
+    let _debug_data_bin = dcm_object
         .element(Tag(0x0043, 0x1086))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UT
-    let software_version_long = dcm_object
+    let _software_version_long = dcm_object
         .element(Tag(0x0043, 0x1087))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UI
-    let PURE_cal_series_uid = dcm_object
+    let _pure_cal_series_uid = dcm_object
         .element(Tag(0x0043, 0x1088))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[3]
-    let gov_body_dbdt_sar_def = dcm_object
+    let _gov_body_dbdt_sar_def = dcm_object
         .element(Tag(0x0043, 0x1089))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: CS
-    let private_inplace_pe_dir = dcm_object
+    let _private_inplace_pe_dir = dcm_object
         .element(Tag(0x0043, 0x108A))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB, not used in DV26
-    let fmri_binary_data_block = dcm_object
+    let _fmri_binary_data_block = dcm_object
         .element(Tag(0x0043, 0x108B))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[6]
-    let voxel_location = dcm_object
+    let _voxel_location = dcm_object
         .element(Tag(0x0043, 0x108C))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     //VR: DS[7n]
-    let sat_band_locations = dcm_object
+    let _sat_band_locations = dcm_object
         .element(Tag(0x0043, 0x108D))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[3]
-    let spectro_prescan_values = dcm_object
+    let _spectro_prescan_values = dcm_object
         .element(Tag(0x0043, 0x108E))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[3]
-    let spectro_parameters = dcm_object
+    let _spectro_parameters = dcm_object
         .element(Tag(0x0043, 0x108F))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1..n]
-    let sar_definition = dcm_object
+    let _sar_definition = dcm_object
         .element(Tag(0x0043, 0x1090))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let sar_value = dcm_object
+    let _sar_value = dcm_object
         .element(Tag(0x0043, 0x1091))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let image_error_text = dcm_object
+    let _image_error_text = dcm_object
         .element(Tag(0x0043, 0x1092))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let spectro_quantitation_values = dcm_object
+    let _spectro_quantitation_values = dcm_object
         .element(Tag(0x0043, 0x1093))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let spectro_ratio_values = dcm_object
+    let _spectro_ratio_values = dcm_object
         .element(Tag(0x0043, 0x1094))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let prescan_reuse_string = dcm_object
+    let _prescan_reuse_string = dcm_object
         .element(Tag(0x0043, 0x1095))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: CS
-    let content_qualification = dcm_object
+    let _content_qualification = dcm_object
         .element(Tag(0x0043, 0x1096))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[8]
-    let image_filtering_parameters = dcm_object
+    let _image_filtering_parameters = dcm_object
         .element(Tag(0x0043, 0x1097))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: UI
-    let asset_acquisition_calibration_uid = dcm_object
+    let _asset_acquisition_calibration_uid = dcm_object
         .element(Tag(0x0043, 0x1098))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1..n]
-    let extended_options = dcm_object
+    let _extended_options = dcm_object
         .element(Tag(0x0043, 0x1099))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: IS
-    let rx_stack_identification = dcm_object
+    let _rx_stack_identification = dcm_object
         .element(Tag(0x0043, 0x109A))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS
-    let npw_factor = dcm_object
+    let _npw_factor = dcm_object
         .element(Tag(0x0043, 0x109B))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let research_tag_1 = dcm_object
+    let _research_tag_1 = dcm_object
         .element(Tag(0x0043, 0x109C))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let research_tag_2 = dcm_object
+    let _research_tag_2 = dcm_object
         .element(Tag(0x0043, 0x109D))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let research_tag_3 = dcm_object
+    let _research_tag_3 = dcm_object
         .element(Tag(0x0043, 0x109E))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: OB
-    let research_tag_4 = dcm_object
+    let _research_tag_4 = dcm_object
         .element(Tag(0x0043, 0x109F))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SQ
-    let spectroscopy_pixel_sequence = dcm_object
+    let _spectroscopy_pixel_sequence = dcm_object
         .element(Tag(0x0043, 0x10A0))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SQ
-    let spectroscopy_default_display_sequence = dcm_object
+    let _spectroscopy_default_display_sequence = dcm_object
         .element(Tag(0x0043, 0x10A1))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VS: DS[1..n]
-    let mef_data = dcm_object
+    let _mef_data = dcm_object
         .element(Tag(0x0043, 0x10A2))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: CS
-    let asl_contrast_technique = dcm_object
+    let _asl_contrast_technique = dcm_object
         .element(Tag(0x0043, 0x10A3))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let detailed_text_for_ASL_labeling = dcm_object
+    let _detailed_text_for_asl_labeling = dcm_object
         .element(Tag(0x0043, 0x10A4))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: IS
-    let duration_of_label_or_ctrl_pulse = dcm_object
+    let _duration_of_label_or_ctrl_pulse = dcm_object
         .element(Tag(0x0043, 0x10A5))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS, not used in DV26
-    let offset_frequency_fastb1map = dcm_object
+    let _offset_frequency_fastb1map = dcm_object
         .element(Tag(0x0043, 0x10A6))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS
-    let motion_encoding_factor = dcm_object
+    let _motion_encoding_factor = dcm_object
         .element(Tag(0x0043, 0x10A7))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[3]
-    let dual_drive_mode_amplitude_attenuation_phase_offset = dcm_object
+    let _dual_drive_mode_amplitude_attenuation_phase_offset = dcm_object
         .element(Tag(0x0043, 0x10A8))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1..n]
-    let threed_cal_data = dcm_object
+    let _threed_cal_data = dcm_object
         .element(Tag(0x0043, 0x10A9))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1..n]
-    let additional_filtering_parameters = dcm_object
+    let _additional_filtering_parameters = dcm_object
         .element(Tag(0x0043, 0x10AA))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let silenz_data = dcm_object
+    let _silenz_data = dcm_object
         .element(Tag(0x0043, 0x10AB))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1..n], reserved for future use
-    let qmap_delay_data = dcm_object
+    let _qmap_delay_data = dcm_object
         .element(Tag(0x0043, 0x10AC))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let other_recovery_times_values = dcm_object
+    let _other_recovery_times_values = dcm_object
         .element(Tag(0x0043, 0x10AD))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[1..n]
-    let other_recovery_times_labels = dcm_object
+    let _other_recovery_times_labels = dcm_object
         .element(Tag(0x0043, 0x10AE))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let additional_echo_times = dcm_object
+    let _additional_echo_times = dcm_object
         .element(Tag(0x0043, 0x10AF))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: FL
-    let rescan_time_in_acquisition = dcm_object
+    let _rescan_time_in_acquisition = dcm_object
         .element(Tag(0x0043, 0x10B0))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let excitation_mode = dcm_object
+    let _excitation_mode = dcm_object
         .element(Tag(0x0043, 0x10B1))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let advanced_eddy_correction = dcm_object
+    let _advanced_eddy_correction = dcm_object
         .element(Tag(0x0043, 0x10B3))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: SS
-    let mrf_transmit_gain = dcm_object
+    let _mrf_transmit_gain = dcm_object
         .element(Tag(0x0043, 0x10B4))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let mr_table_position_information = dcm_object
+    let _mr_table_position_information = dcm_object
         .element(Tag(0x0043, 0x10B2))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[7]
-    let multiband_parameters = dcm_object
+    let _multiband_parameters = dcm_object
         .element(Tag(0x0043, 0x10B6))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO[4]
-    let compressed_sensing_parameters = dcm_object
+    let _compressed_sensing_parameters = dcm_object
         .element(Tag(0x0043, 0x10B7))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS
-    let grad_comp_parameters = dcm_object
+    let _grad_comp_parameters = dcm_object
         .element(Tag(0x0043, 0x10B8))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let parallel_transmit_information = dcm_object
+    let _parallel_transmit_information = dcm_object
         .element(Tag(0x0043, 0x10B9))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS
-    let echo_spacing = dcm_object
+    let _echo_spacing = dcm_object
         .element(Tag(0x0043, 0x10BA))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let pixel_information = dcm_object
+    let _pixel_information = dcm_object
         .element(Tag(0x0043, 0x10BB))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: IS
-    let heart_beats_pattern = dcm_object
+    let _heart_beats_pattern = dcm_object
         .element(Tag(0x0043, 0x10BC))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: LO
-    let hyperKat_factor = dcm_object
+    let _hyper_kat_factor = dcm_object
         .element(Tag(0x0043, 0x10BD))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
         });
 
     // VR: DS[1..n]
-    let delta_transmit_gain = dcm_object
+    let _delta_transmit_gain = dcm_object
         .element(Tag(0x0043, 0x10BF))
         .map_or("N/A".to_string(), |e| {
             e.value().to_str().unwrap().to_string()
@@ -1001,12 +996,12 @@ pub fn scan_gems_parm_01(dcm_object: &InMemDicomObject<StandardDataDictionary>, 
     if !suppress_output {
         println!(
             "GEHC Private Creator ID: {} Peak dB/dt: {} dB/dt limits: {}% PSD estimated limit: {} Tps: {} SAR avg head: {}",
-            gehc_private_creator_ID,
-        peak_dbdt,
-        dbdt_limits_percent,
-        psd_estimatated_limit,
-        psd_estimated_limit_Tps,
-        sar_avg_head
+            gehc_private_creator_id,
+            peak_dbdt,
+            dbdt_limits_percent,
+            psd_estimatated_limit,
+            psd_estimated_limit_tps,
+            sar_avg_head
         );
     }
 }
@@ -1019,7 +1014,7 @@ pub fn deep_scan_dicom_candidates_parallel(
     let mut all_candidates = Vec::new();
 
     for i in 0..archive.len() {
-        let mut file = match archive.by_index(i) {
+        let file = match archive.by_index(i) {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -1084,7 +1079,7 @@ pub fn deep_scan_dicom_candidates_parallel(
                 e.value().to_str().unwrap().to_string()
             });
 
-        let series_date = dcm_object
+        let _series_date = dcm_object
             .element(tags::SERIES_DATE)
             .map_or("N/A".to_string(), |e| {
                 e.value().to_str().unwrap().to_string()
@@ -1096,7 +1091,7 @@ pub fn deep_scan_dicom_candidates_parallel(
                 e.value().to_str().unwrap().to_string()
             });
 
-        let series_time = dcm_object
+        let _series_time = dcm_object
             .element(tags::SERIES_TIME)
             .map_or("N/A".to_string(), |e| {
                 e.value().to_str().unwrap().to_string()
@@ -1125,73 +1120,73 @@ pub fn deep_scan_dicom_candidates_parallel(
                 println!("This is an enhanced MR image DICOM file");
             }
 
-            let acquisition_number = dcm_object
+            let _acquisition_number = dcm_object
                 .element(tags::ACQUISITION_NUMBER)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let acquisiton_date_time = dcm_object
+            let _acquisiton_date_time = dcm_object
                 .element(tags::ACQUISITION_DATE_TIME)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let content_qualification = dcm_object
+            let _content_qualification = dcm_object
                 .element(tags::CONTENT_QUALIFICATION)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let resonant_nucleus = dcm_object
+            let _resonant_nucleus = dcm_object
                 .element(tags::RESONANT_NUCLEUS)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let kspace_filtering = dcm_object
+            let _kspace_filtering = dcm_object
                 .element(tags::K_SPACE_FILTERING)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let magnetic_field_strength = dcm_object
+            let _magnetic_field_strength = dcm_object
                 .element(tags::MAGNETIC_FIELD_STRENGTH)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let applicable_safety_standard_agency = dcm_object
+            let _applicable_safety_standard_agency = dcm_object
                 .element(tags::APPLICABLE_SAFETY_STANDARD_AGENCY)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let applicable_safety_standard_description = dcm_object
+            let _applicable_safety_standard_description = dcm_object
                 .element(tags::APPLICABLE_SAFETY_STANDARD_DESCRIPTION)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let image_comments = dcm_object
+            let _image_comments = dcm_object
                 .element(tags::IMAGE_COMMENTS)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let isocenter_position = dcm_object
+            let _isocenter_position = dcm_object
                 .element(tags::ISOCENTER_POSITION)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let B1rms = dcm_object
+            let _b1rms = dcm_object
                 .element(tags::B1RMS)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let acquisition_contrast = dcm_object
+            let _acquisition_contrast = dcm_object
                 .element(tags::ACQUISITION_CONTRAST)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1204,7 +1199,7 @@ pub fn deep_scan_dicom_candidates_parallel(
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let inplane_phase_encoding_direction = dcm_object
+            let _inplane_phase_encoding_direction = dcm_object
                 .element(tags::IN_PLANE_PHASE_ENCODING_DIRECTION)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1228,13 +1223,13 @@ pub fn deep_scan_dicom_candidates_parallel(
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let percent_sampling = dcm_object
+            let _percent_sampling = dcm_object
                 .element(tags::PERCENT_SAMPLING)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let percent_phase_field_of_view = dcm_object
+            let _percent_phase_field_of_view = dcm_object
                 .element(tags::PERCENT_PHASE_FIELD_OF_VIEW)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1245,8 +1240,8 @@ pub fn deep_scan_dicom_candidates_parallel(
                     "MRFOV_GEOMETRY_SEQUENCE: {} freq: {} phas: {} kz: {}",
                     mr_fov_geometry_sequence,
                     mr_acquisition_frequency_encoding_steps,
-                mr_acquisition_phase_encoding_steps_inplane,
-                mr_acquisition_phase_encoding_steps_outofplane
+                    mr_acquisition_phase_encoding_steps_inplane,
+                    mr_acquisition_phase_encoding_steps_outofplane
                 );
             }
 
@@ -1286,14 +1281,14 @@ pub fn deep_scan_dicom_candidates_parallel(
                 });
 
             // get the dB/dt value
-            let db_dt = dcm_object
+            let _db_dt = dcm_object
                 .element(tags::D_BDT)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
             // get the isocenter position
-            let isocenter_position = dcm_object
+            let _isocenter_position = dcm_object
                 .element(tags::ISOCENTER_POSITION)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1313,7 +1308,7 @@ pub fn deep_scan_dicom_candidates_parallel(
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let number_pe = dcm_object
+            let _number_pe = dcm_object
                 .element(tags::NUMBER_OF_PHASE_ENCODING_STEPS)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1356,25 +1351,25 @@ pub fn deep_scan_dicom_candidates_parallel(
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let b1_rms = dcm_object
+            let _b1_rms = dcm_object
                 .element(tags::B1RMS)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let bits_allocated = dcm_object
+            let _bits_allocated = dcm_object
                 .element(tags::BITS_ALLOCATED)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let bits_stored = dcm_object
+            let _bits_stored = dcm_object
                 .element(tags::BITS_STORED)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let high_bit = dcm_object
+            let _high_bit = dcm_object
                 .element(tags::HIGH_BIT)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1404,13 +1399,13 @@ pub fn deep_scan_dicom_candidates_parallel(
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let inversion_time = dcm_object
+            let _inversion_time = dcm_object
                 .element(tags::INVERSION_TIME)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let sequence_name = dcm_object
+            let _sequence_name = dcm_object
                 .element(tags::SEQUENCE_NAME)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1440,7 +1435,7 @@ pub fn deep_scan_dicom_candidates_parallel(
                     e.value().to_str().unwrap().to_string()
                 });
 
-            let variable_flip_flag = dcm_object
+            let _variable_flip_flag = dcm_object
                 .element(tags::VARIABLE_FLIP_ANGLE_FLAG)
                 .map_or("N/A".to_string(), |e| {
                     e.value().to_str().unwrap().to_string()
@@ -1463,34 +1458,34 @@ pub fn deep_scan_dicom_candidates_parallel(
             if !suppress_output {
                 println!(
                     "{} \"{}\" [{},{},{}] DIM: {}, SAR: {} RX Coil {} BW: {}Hz/px, TE: {}, TR: {}, FA: {}, AMTX: {} PE_dir: {} FOV: {} pFOV: {}%, samp: {}%, RES: {}, rows: {}, cols: {}, thick: {}, c2c: {}, res: {}",
-                series_number,
-                series_description,
-                scanning_sequence,
-                sequence_variant,
-                scan_options,
-                mr_acquisition_type,
-                sar,
-                receive_coil_name,
-                pixel_bandwidth,
-                te,
-                tr,
-                flip_angle,
-                acq_matrix,
-                phase_encoding_direction,
-                reconstruction_diameter,
-                percent_phase_fov,
-                percent_sampling,
-                pixel_spacing,
-                rows,
-                columns,
-                slice_thickness,
-                center_to_center_slice_gap,
-                calculate_acq_resolution(
-                    acq_matrix.clone(),
-                    rows.clone(),
-                    columns.clone(),
-                    pixel_spacing.clone(),
-                )
+                    series_number,
+                    series_description,
+                    scanning_sequence,
+                    sequence_variant,
+                    scan_options,
+                    mr_acquisition_type,
+                    sar,
+                    receive_coil_name,
+                    pixel_bandwidth,
+                    te,
+                    tr,
+                    flip_angle,
+                    acq_matrix,
+                    phase_encoding_direction,
+                    reconstruction_diameter,
+                    percent_phase_fov,
+                    percent_sampling,
+                    pixel_spacing,
+                    rows,
+                    columns,
+                    slice_thickness,
+                    center_to_center_slice_gap,
+                    calculate_acq_resolution(
+                        acq_matrix.clone(),
+                        rows.clone(),
+                        columns.clone(),
+                        pixel_spacing.clone(),
+                    )
                 );
             }
 
@@ -1511,127 +1506,127 @@ pub fn deep_scan_dicom_candidates_parallel(
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
-                let table_delta = dcm_object
+                let _table_delta = dcm_object
                     .element(Tag(0x0019, 0x107F))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let gehc_private_creator_ID = dcm_object
+                let _gehc_private_creator_id = dcm_object
                     .element(Tag(0x0043, 0x0010))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let bitmap_of_prescan_options = dcm_object
+                let _bitmap_of_prescan_options = dcm_object
                     .element(Tag(0x0043, 0x1001))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let gradient_offset_x = dcm_object
+                let _gradient_offset_x = dcm_object
                     .element(Tag(0x0043, 0x1002))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let gradient_offset_y = dcm_object
+                let _gradient_offset_y = dcm_object
                     .element(Tag(0x0043, 0x1003))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let gradient_offset_z = dcm_object
+                let _gradient_offset_z = dcm_object
                     .element(Tag(0x0043, 0x1004))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let image_is_original = dcm_object
+                let _image_is_original = dcm_object
                     .element(Tag(0x0043, 0x1005))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let number_of_epi_shots = dcm_object
+                let _number_of_epi_shots = dcm_object
                     .element(Tag(0x0043, 0x1006))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let views_per_segment = dcm_object
+                let _views_per_segment = dcm_object
                     .element(Tag(0x0043, 0x1007))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let respiratory_rate_bpm = dcm_object
+                let _respiratory_rate_bpm = dcm_object
                     .element(Tag(0x0043, 0x1008))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let respiratory_trigger_point = dcm_object
+                let _respiratory_trigger_point = dcm_object
                     .element(Tag(0x0043, 0x1009))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let type_of_receiver_used = dcm_object
+                let _type_of_receiver_used = dcm_object
                     .element(Tag(0x0043, 0x100A))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let peak_dbdt = dcm_object
+                let _peak_dbdt = dcm_object
                     .element(Tag(0x0043, 0x100B))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let dbdt_limits_percent = dcm_object
+                let _dbdt_limits_percent = dcm_object
                     .element(Tag(0x0043, 0x100C))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let psd_estimatated_limit = dcm_object
+                let _psd_estimatated_limit = dcm_object
                     .element(Tag(0x0043, 0x100D))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let psd_estimated_limit_Tps = dcm_object
+                let _psd_estimated_limit_tps = dcm_object
                     .element(Tag(0x0043, 0x100E))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let sar_avg_head = dcm_object
+                let _sar_avg_head = dcm_object
                     .element(Tag(0x0043, 0x100F))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let application_name = dcm_object
+                let _application_name = dcm_object
                     .element(Tag(0x0043, 0x1077))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let application_version = dcm_object
+                let _application_version = dcm_object
                     .element(Tag(0x0043, 0x1078))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let slices_per_volume = dcm_object
+                let _slices_per_volume = dcm_object
                     .element(Tag(0x0043, 0x1079))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
                     });
 
-                let asset_R_factors = dcm_object
+                let asset_r_factors = dcm_object
                     .element(Tag(0x0043, 0x1083))
                     .map_or("N/A".to_string(), |e| {
                         e.value().to_str().unwrap().to_string()
@@ -1644,7 +1639,7 @@ pub fn deep_scan_dicom_candidates_parallel(
                         internal_sequence_name,
                         Duration::from_micros(acquisition_duration as u64),
                         number_of_echoes,
-                        asset_R_factors,
+                        asset_r_factors,
                     );
                 }
 

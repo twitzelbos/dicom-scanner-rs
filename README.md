@@ -20,6 +20,9 @@ cd dicom-scanner-rs
 
 # Build the project
 cargo build --release
+
+# (Optional) Set up pre-commit hooks
+./scripts/setup-pre-commit.sh
 ```
 
 ## Usage
@@ -44,6 +47,33 @@ The `scripts/` folder contains utility scripts:
 
 MIT
 
+## Development
+
+This project uses pre-commit hooks to ensure code quality:
+
+- **ShellCheck** & **shfmt**: For shell script linting and formatting
+- **Clippy** & **rustfmt**: For Rust linting and formatting
+- **cargo test**: Runs all tests before commit
+
+### Setting up development environment
+
+```bash
+# Install pre-commit hooks
+./scripts/setup-pre-commit.sh
+
+# Run hooks manually
+pre-commit run --all-files
+
+# Skip hooks if needed (not recommended)
+git commit --no-verify
+```
+
 ## Contributing
 
 Contributions welcome! Please feel free to submit a Pull Request.
+
+All PRs must pass:
+- Clippy linting
+- Code formatting checks
+- All tests
+- Pre-commit hooks
