@@ -1,0 +1,10 @@
+[package]
+name = "dicom_scanner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zip = "0.6"
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+dicom = "0.8.1"

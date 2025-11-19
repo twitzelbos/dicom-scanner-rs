@@ -1,0 +1,9 @@
+/target
+
+# Test data files
+*.zip
+DICOMDIR
+sample-archive/
+
+# OS files
+.DS_Store
