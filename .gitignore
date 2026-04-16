@@ -1,7 +1,9 @@
 /target
+**/target
 
 # Test data files
 *.zip
+*.dcm
 DICOMDIR
 sample-archive/
 

@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dicom::core::VR;
+use dicom::core::value::Value;
 use dicom::object::mem::InMemDicomObject;
 use dicom::{
     core::Tag,
@@ -34,6 +36,10 @@ struct Args {
     /// Output directory to extract and organize DICOM files by series
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Output directory to extract XProtocol data from Siemens DICOM files
+    #[arg(long)]
+    xprot: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1035,6 +1041,381 @@ pub fn scan_gems_parm_01(
     }
 }
 
+// --- Siemens XProtocol extraction and recursive SQ traversal ---
+
+pub fn is_csa_header(data: &[u8]) -> bool {
+    data.len() >= 4 && &data[0..4] == b"SV10"
+}
+
+pub fn parse_csa_header(data: &[u8]) -> Option<String> {
+    if !is_csa_header(data) {
+        return None;
+    }
+
+    let mut offset = 8; // skip SV10 signature (4 bytes) + unused (4 bytes)
+
+    if data.len() < offset + 4 {
+        return None;
+    }
+
+    let num_elements = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+    offset += 4;
+
+    // skip unused 4 bytes after num_elements
+    offset += 4;
+
+    for _ in 0..num_elements {
+        if data.len() < offset + 64 + 4 + 4 + 4 + 4 {
+            break;
+        }
+
+        let name_bytes = &data[offset..offset + 64];
+        let name = String::from_utf8_lossy(name_bytes)
+            .trim_end_matches('\0')
+            .to_string();
+        offset += 64;
+
+        // skip VM (4 bytes), VR (4 bytes), sync pattern (4 bytes)
+        offset += 12;
+
+        let num_items = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        offset += 4;
+
+        let mut element_data = Vec::new();
+        for _ in 0..num_items {
+            if data.len() < offset + 4 {
+                break;
+            }
+            let item_len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+
+            // skip 3 unused u32 fields
+            if data.len() < offset + 12 {
+                break;
+            }
+            offset += 12;
+
+            if item_len > 0 && offset + item_len <= data.len() {
+                element_data.extend_from_slice(&data[offset..offset + item_len]);
+            }
+
+            // items are padded to 4-byte boundaries
+            let padded_len = (item_len + 3) & !3;
+            if offset + padded_len > data.len() {
+                break;
+            }
+            offset += padded_len;
+        }
+
+        if name.contains("Protocol") || name == "MrPhoenixProtocol" {
+            if let Some(start_pos) = element_data
+                .windows(10)
+                .position(|w| w.starts_with(b"### ASCCONV") || w.starts_with(b"<XProtocol>"))
+            {
+                let content = &element_data[start_pos..];
+                let trimmed_len = content
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                return Some(String::from_utf8_lossy(&content[..trimmed_len]).to_string());
+            } else if !element_data.is_empty() {
+                let trimmed_len = element_data
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                if trimmed_len > 0 {
+                    return Some(String::from_utf8_lossy(&element_data[..trimmed_len]).to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn parse_dicom_sequence(data: &[u8]) -> Option<String> {
+    let mut offset = 0;
+
+    if data.len() < 8 || data[0] != 0xFE || data[1] != 0xFF || data[2] != 0x00 || data[3] != 0xE0 {
+        return None;
+    }
+    offset += 4;
+
+    let item_length = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+    offset += 4;
+
+    let item_end = if item_length == 0xFFFFFFFF {
+        data.len()
+    } else {
+        offset + item_length
+    };
+
+    while offset + 8 <= item_end && offset + 8 <= data.len() {
+        let group = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?);
+        let element = u16::from_le_bytes(data[offset + 2..offset + 4].try_into().ok()?);
+        offset += 4;
+
+        if group == 0xFFFE && (element == 0xE00D || element == 0xE0DD) {
+            offset += 4;
+            continue;
+        }
+
+        let vr_bytes = if offset + 2 <= data.len() {
+            [data[offset], data[offset + 1]]
+        } else {
+            break;
+        };
+        let vr = String::from_utf8_lossy(&vr_bytes).to_string();
+        offset += 2;
+
+        let valid_vr = vr_bytes[0].is_ascii_uppercase() && vr_bytes[1].is_ascii_uppercase();
+
+        let value_length = if !valid_vr {
+            offset -= 2;
+            if offset + 4 > data.len() {
+                break;
+            }
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+            len
+        } else if vr == "OB" || vr == "OW" || vr == "SQ" || vr == "UN" || vr == "UT" {
+            offset += 2;
+            if offset + 4 > data.len() {
+                break;
+            }
+            u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize
+        } else {
+            if offset + 2 > data.len() {
+                break;
+            }
+            u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize
+        };
+
+        if !valid_vr {
+            // offset already advanced above
+        } else if vr == "OB" || vr == "OW" || vr == "SQ" || vr == "UN" || vr == "UT" {
+            offset += 4;
+        } else {
+            offset += 2;
+        }
+
+        if offset + value_length <= data.len() {
+            let tag_data = &data[offset..offset + value_length];
+
+            if let Some(xprot_pos) = tag_data
+                .windows(11)
+                .position(|window| window.starts_with(b"<XProtocol>"))
+            {
+                let content = &tag_data[xprot_pos..];
+                let trimmed_len = content
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                return Some(String::from_utf8_lossy(&content[..trimmed_len]).to_string());
+            }
+        }
+
+        offset += value_length;
+    }
+
+    None
+}
+
+pub fn extract_tag_recursive(
+    obj: &InMemDicomObject<StandardDataDictionary>,
+    tag_to_find: Tag,
+) -> Option<String> {
+    if let Ok(tag_element) = obj.element(tag_to_find)
+        && let Ok(bytes) = tag_element.to_bytes()
+    {
+        if tag_to_find == Tag(0x0021, 0x10fe) {
+            if bytes.len() >= 4
+                && bytes[0] == 0xFE
+                && bytes[1] == 0xFF
+                && bytes[2] == 0x00
+                && bytes[3] == 0xE0
+            {
+                if let Some(parsed) = parse_dicom_sequence(&bytes) {
+                    return Some(parsed);
+                }
+            } else if is_csa_header(&bytes)
+                && let Some(parsed) = parse_csa_header(&bytes)
+            {
+                return Some(parsed);
+            }
+        }
+        let trimmed_len = bytes
+            .iter()
+            .rposition(|&b| b != 0)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        return Some(String::from_utf8_lossy(&bytes[..trimmed_len]).to_string());
+    }
+
+    for element in obj.iter() {
+        if element.vr() == VR::SQ
+            && let Value::Sequence(sequence) = element.value()
+        {
+            for item in sequence.items() {
+                if let Some(value) = extract_tag_recursive(item, tag_to_find) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn get_tag_string(obj: &InMemDicomObject<StandardDataDictionary>, tag: Tag) -> String {
+    if let Ok(element) = obj.element(tag)
+        && let Ok(s) = element.value().to_str()
+    {
+        return s.to_string();
+    }
+
+    for element in obj.iter() {
+        if element.vr() == VR::SQ
+            && let Value::Sequence(sequence) = element.value()
+        {
+            for item in sequence.items() {
+                let result = get_tag_string(item, tag);
+                if result != "N/A" {
+                    return result;
+                }
+            }
+        }
+    }
+
+    "N/A".to_string()
+}
+
+pub fn extract_xprotocol_from_zip(
+    zip_bytes: &[u8],
+    output_dir: &Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::io::Write;
+
+    fs::create_dir_all(output_dir)?;
+
+    let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
+    let mut seen_series: HashSet<String> = HashSet::new();
+    let mut extracted_count = 0;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        if file.is_dir() {
+            continue;
+        }
+
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+
+        let dcm_object = match OpenFileOptions::new()
+            .read_until(tags::PIXEL_DATA)
+            .from_reader(Cursor::new(&buf))
+        {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
+
+        let manufacturer = dcm_object
+            .element(tags::MANUFACTURER)
+            .map_or(String::new(), |e| {
+                e.value().to_str().unwrap_or_default().to_uppercase()
+            });
+
+        if !manufacturer.contains("SIEMENS") {
+            continue;
+        }
+
+        let series_uid = dcm_object
+            .element(tags::SERIES_INSTANCE_UID)
+            .map_or("unknown".to_string(), |e| {
+                e.value().to_str().unwrap_or_default().to_string()
+            });
+
+        if seen_series.contains(&series_uid) {
+            continue;
+        }
+
+        let tag_1019 = extract_tag_recursive(&dcm_object, Tag(0x0021, 0x1019));
+        let tag_10fe = extract_tag_recursive(&dcm_object, Tag(0x0021, 0x10fe));
+
+        if tag_1019.is_none() && tag_10fe.is_none() {
+            seen_series.insert(series_uid);
+            continue;
+        }
+
+        let series_desc =
+            dcm_object
+                .element(tags::SERIES_DESCRIPTION)
+                .map_or("Unknown".to_string(), |e| {
+                    let s = e.value().to_str().unwrap_or_default().trim().to_string();
+                    if s.is_empty() {
+                        "Unknown".to_string()
+                    } else {
+                        s
+                    }
+                });
+
+        let series_num = dcm_object
+            .element(tags::SERIES_NUMBER)
+            .map_or(String::new(), |e| {
+                e.value().to_str().unwrap_or_default().trim().to_string()
+            });
+
+        let short_uid = &series_uid.split('.').next_back().unwrap_or(&series_uid)[..8.min(
+            series_uid
+                .split('.')
+                .next_back()
+                .unwrap_or(&series_uid)
+                .len(),
+        )];
+
+        let filename = if series_num.is_empty() {
+            format!("{}_{}.xprot", sanitize_filename(&series_desc), short_uid)
+        } else {
+            format!(
+                "{:04}_{}_{}.xprot",
+                series_num.parse::<i32>().unwrap_or(0),
+                sanitize_filename(&series_desc),
+                short_uid
+            )
+        };
+
+        let output_path = output_dir.join(&filename);
+        let mut out_file = fs::File::create(&output_path)?;
+
+        if let Some(value) = &tag_1019 {
+            write!(out_file, "{}", value)?;
+        }
+        if let Some(value) = &tag_10fe {
+            if tag_1019.is_some() {
+                writeln!(out_file)?;
+                writeln!(out_file)?;
+            }
+            write!(out_file, "{}", value)?;
+        }
+
+        println!(
+            "  Extracted XProtocol: {} (series: {})",
+            filename, series_desc
+        );
+        extracted_count += 1;
+        seen_series.insert(series_uid);
+    }
+
+    Ok(extracted_count)
+}
+
 pub fn deep_scan_dicom_candidates_parallel(
     zip_bytes: &[u8],
     suppress_output: bool,
@@ -1067,150 +1448,30 @@ pub fn deep_scan_dicom_candidates_parallel(
 
         let dcm_object = dcm_result.unwrap();
 
-        // get the study instance UID
-        let study_instance_uid = dcm_object
-            .element(tags::STUDY_INSTANCE_UID)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
+        let study_instance_uid = get_tag_string(&dcm_object, tags::STUDY_INSTANCE_UID);
+        let series_instance_uid = get_tag_string(&dcm_object, tags::SERIES_INSTANCE_UID);
+        let patient_id = get_tag_string(&dcm_object, PATIENT_ID);
+        let sop_instance_uid = get_tag_string(&dcm_object, tags::SOP_INSTANCE_UID);
+        let modality = get_tag_string(&dcm_object, tags::MODALITY);
 
-        // get the series instance UID
-        let series_instance_uid = dcm_object
-            .element(tags::SERIES_INSTANCE_UID)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
+        let protocol_name = get_tag_string(&dcm_object, tags::PROTOCOL_NAME);
+        let study_description = get_tag_string(&dcm_object, tags::STUDY_DESCRIPTION);
+        let series_description = get_tag_string(&dcm_object, tags::SERIES_DESCRIPTION);
+        let _series_date = get_tag_string(&dcm_object, tags::SERIES_DATE);
+        let series_number = get_tag_string(&dcm_object, tags::SERIES_NUMBER);
+        let _series_time = get_tag_string(&dcm_object, tags::SERIES_TIME);
+        let manufacturer = get_tag_string(&dcm_object, tags::MANUFACTURER);
 
-        // get the patient ID (MRN)
-        let patient_id = dcm_object
-            .element(PATIENT_ID)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the sop instance UID
-        let sop_instance_uid = dcm_object
-            .element(tags::SOP_INSTANCE_UID)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the Modality
-        let modality = dcm_object
-            .element(tags::MODALITY)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the Protocol Name
-        let protocol_name = dcm_object
-            .element(tags::PROTOCOL_NAME)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the Study Description
-        let study_description = dcm_object
-            .element(tags::STUDY_DESCRIPTION)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let series_description = dcm_object
-            .element(tags::SERIES_DESCRIPTION)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let _series_date = dcm_object
-            .element(tags::SERIES_DATE)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let series_number = dcm_object
-            .element(tags::SERIES_NUMBER)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let _series_time = dcm_object
-            .element(tags::SERIES_TIME)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the Manufacturer
-        let manufacturer = dcm_object
-            .element(tags::MANUFACTURER)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the MR Acquisition Type (2D or 3D)
-        let acquisition_type = dcm_object
-            .element(tags::MR_ACQUISITION_TYPE)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the Acquisition Time
-        let acquisition_time = dcm_object
-            .element(tags::ACQUISITION_TIME)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get spatial resolution parameters
-        let pixel_spacing = dcm_object
-            .element(tags::PIXEL_SPACING)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let slice_thickness = dcm_object
-            .element(tags::SLICE_THICKNESS)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let rows = dcm_object
-            .element(tags::ROWS)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let columns = dcm_object
-            .element(tags::COLUMNS)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get MR timing parameters
-        let repetition_time = dcm_object
-            .element(tags::REPETITION_TIME)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let echo_time = dcm_object
-            .element(tags::ECHO_TIME)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let inversion_time = dcm_object
-            .element(tags::INVERSION_TIME)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get derivation information
-        let derivation_description = dcm_object
-            .element(tags::DERIVATION_DESCRIPTION)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
+        let acquisition_type = get_tag_string(&dcm_object, tags::MR_ACQUISITION_TYPE);
+        let acquisition_time = get_tag_string(&dcm_object, tags::ACQUISITION_TIME);
+        let pixel_spacing = get_tag_string(&dcm_object, tags::PIXEL_SPACING);
+        let slice_thickness = get_tag_string(&dcm_object, tags::SLICE_THICKNESS);
+        let rows = get_tag_string(&dcm_object, tags::ROWS);
+        let columns = get_tag_string(&dcm_object, tags::COLUMNS);
+        let repetition_time = get_tag_string(&dcm_object, tags::REPETITION_TIME);
+        let echo_time = get_tag_string(&dcm_object, tags::ECHO_TIME);
+        let inversion_time = get_tag_string(&dcm_object, tags::INVERSION_TIME);
+        let derivation_description = get_tag_string(&dcm_object, tags::DERIVATION_DESCRIPTION);
 
         // Check for referenced series (source series for derived images)
         let referenced_series_uid =
@@ -1234,74 +1495,30 @@ pub fn deep_scan_dicom_candidates_parallel(
                 "N/A".to_string()
             };
 
-        // Get acquisition duration - try standard DICOM tag first
-        // Note: This tag is not always populated. Vendor-specific:
-        // - GE: Uses private tag (0019,105A) - handled below
-        // - Siemens: May use CSA headers or other private tags
-        // - Philips: Has their own private structure
-        let mut acquisition_duration = dcm_object
-            .element(Tag(0x0018, 0x9073))  // Standard Acquisition Duration tag
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap_or(std::borrow::Cow::Borrowed("N/A")).to_string()
-            });
+        let mut acquisition_duration = get_tag_string(&dcm_object, Tag(0x0018, 0x9073));
+        let flip_angle = get_tag_string(&dcm_object, tags::FLIP_ANGLE);
+        let number_of_averages = get_tag_string(&dcm_object, tags::NUMBER_OF_AVERAGES);
+        let echo_train_length = get_tag_string(&dcm_object, tags::ECHO_TRAIN_LENGTH);
 
-        // Get MR-specific technical parameters
-        let flip_angle = dcm_object
-            .element(tags::FLIP_ANGLE)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
+        // Parallel imaging factor - try vendor-specific tags in priority order
+        let mut parallel_imaging_factor = {
+            let val = get_tag_string(&dcm_object, Tag(0x0018, 0x9069));
+            if val != "N/A" {
+                val
+            } else {
+                let val = get_tag_string(&dcm_object, Tag(0x0051, 0x1011));
+                if val != "N/A" {
+                    val
+                } else {
+                    get_tag_string(&dcm_object, Tag(0x0018, 0x9078))
+                }
+            }
+        };
 
-        let number_of_averages = dcm_object
-            .element(tags::NUMBER_OF_AVERAGES)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let echo_train_length = dcm_object
-            .element(tags::ECHO_TRAIN_LENGTH)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // Parallel imaging factor - try common vendor-specific tags
-        // Note: Different vendors store this differently:
-        // - GE: Uses ASSET R factors in (0043,1083)
-        // - Siemens: Uses iPAT/GRAPPA info in various tags
-        // - Philips: Uses SENSE factors
-        let mut parallel_imaging_factor = dcm_object
-            .element(Tag(0x0018, 0x9069))  // Standard: Parallel Reduction Factor In-plane
-            .or_else(|_| dcm_object.element(Tag(0x0051, 0x1011)))  // Siemens: PATModeText (contains iPAT info)
-            .or_else(|_| dcm_object.element(Tag(0x0018, 0x9078)))  // Parallel Acquisition Technique
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let magnetic_field_strength = dcm_object
-            .element(tags::MAGNETIC_FIELD_STRENGTH)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // Get image set information
-        let spacing_between_slices = dcm_object
-            .element(tags::SPACING_BETWEEN_SLICES)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        let image_type = dcm_object
-            .element(tags::IMAGE_TYPE)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
-
-        // get the SOP Class UID
-        let sop_class_uid = dcm_object
-            .element(tags::SOP_CLASS_UID)
-            .map_or("N/A".to_string(), |e| {
-                e.value().to_str().unwrap().to_string()
-            });
+        let magnetic_field_strength = get_tag_string(&dcm_object, tags::MAGNETIC_FIELD_STRENGTH);
+        let spacing_between_slices = get_tag_string(&dcm_object, tags::SPACING_BETWEEN_SLICES);
+        let image_type = get_tag_string(&dcm_object, tags::IMAGE_TYPE);
+        let sop_class_uid = get_tag_string(&dcm_object, tags::SOP_CLASS_UID);
 
         if !suppress_output {
             println!("sop_class_uid: {}", sop_class_uid);
@@ -1312,120 +1529,38 @@ pub fn deep_scan_dicom_candidates_parallel(
                 println!("This is an enhanced MR image DICOM file");
             }
 
-            let _acquisition_number = dcm_object
-                .element(tags::ACQUISITION_NUMBER)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _acquisiton_date_time = dcm_object
-                .element(tags::ACQUISITION_DATE_TIME)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _content_qualification = dcm_object
-                .element(tags::CONTENT_QUALIFICATION)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _resonant_nucleus = dcm_object
-                .element(tags::RESONANT_NUCLEUS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _kspace_filtering = dcm_object
-                .element(tags::K_SPACE_FILTERING)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _magnetic_field_strength = dcm_object
-                .element(tags::MAGNETIC_FIELD_STRENGTH)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _applicable_safety_standard_agency = dcm_object
-                .element(tags::APPLICABLE_SAFETY_STANDARD_AGENCY)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _applicable_safety_standard_description = dcm_object
-                .element(tags::APPLICABLE_SAFETY_STANDARD_DESCRIPTION)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _image_comments = dcm_object
-                .element(tags::IMAGE_COMMENTS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _isocenter_position = dcm_object
-                .element(tags::ISOCENTER_POSITION)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _b1rms = dcm_object
-                .element(tags::B1RMS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _acquisition_contrast = dcm_object
-                .element(tags::ACQUISITION_CONTRAST)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            // check the geometry stuff
-            let mr_fov_geometry_sequence = dcm_object
-                .element(tags::MRFOV_GEOMETRY_SEQUENCE)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _inplane_phase_encoding_direction = dcm_object
-                .element(tags::IN_PLANE_PHASE_ENCODING_DIRECTION)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let mr_acquisition_frequency_encoding_steps = dcm_object
-                .element(tags::MR_ACQUISITION_FREQUENCY_ENCODING_STEPS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let mr_acquisition_phase_encoding_steps_inplane = dcm_object
-                .element(tags::MR_ACQUISITION_PHASE_ENCODING_STEPS_IN_PLANE)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let mr_acquisition_phase_encoding_steps_outofplane = dcm_object
-                .element(tags::MR_ACQUISITION_PHASE_ENCODING_STEPS_OUT_OF_PLANE)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _percent_sampling = dcm_object
-                .element(tags::PERCENT_SAMPLING)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _percent_phase_field_of_view = dcm_object
-                .element(tags::PERCENT_PHASE_FIELD_OF_VIEW)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
+            let _acquisition_number = get_tag_string(&dcm_object, tags::ACQUISITION_NUMBER);
+            let _acquisiton_date_time = get_tag_string(&dcm_object, tags::ACQUISITION_DATE_TIME);
+            let _content_qualification = get_tag_string(&dcm_object, tags::CONTENT_QUALIFICATION);
+            let _resonant_nucleus = get_tag_string(&dcm_object, tags::RESONANT_NUCLEUS);
+            let _kspace_filtering = get_tag_string(&dcm_object, tags::K_SPACE_FILTERING);
+            let _magnetic_field_strength =
+                get_tag_string(&dcm_object, tags::MAGNETIC_FIELD_STRENGTH);
+            let _applicable_safety_standard_agency =
+                get_tag_string(&dcm_object, tags::APPLICABLE_SAFETY_STANDARD_AGENCY);
+            let _applicable_safety_standard_description =
+                get_tag_string(&dcm_object, tags::APPLICABLE_SAFETY_STANDARD_DESCRIPTION);
+            let _image_comments = get_tag_string(&dcm_object, tags::IMAGE_COMMENTS);
+            let _isocenter_position = get_tag_string(&dcm_object, tags::ISOCENTER_POSITION);
+            let _b1rms = get_tag_string(&dcm_object, tags::B1RMS);
+            let _acquisition_contrast = get_tag_string(&dcm_object, tags::ACQUISITION_CONTRAST);
+            let mr_fov_geometry_sequence =
+                get_tag_string(&dcm_object, tags::MRFOV_GEOMETRY_SEQUENCE);
+            let _inplane_phase_encoding_direction =
+                get_tag_string(&dcm_object, tags::IN_PLANE_PHASE_ENCODING_DIRECTION);
+            let mr_acquisition_frequency_encoding_steps =
+                get_tag_string(&dcm_object, tags::MR_ACQUISITION_FREQUENCY_ENCODING_STEPS);
+            let mr_acquisition_phase_encoding_steps_inplane = get_tag_string(
+                &dcm_object,
+                tags::MR_ACQUISITION_PHASE_ENCODING_STEPS_IN_PLANE,
+            );
+            let mr_acquisition_phase_encoding_steps_outofplane = get_tag_string(
+                &dcm_object,
+                tags::MR_ACQUISITION_PHASE_ENCODING_STEPS_OUT_OF_PLANE,
+            );
+            let _percent_sampling = get_tag_string(&dcm_object, tags::PERCENT_SAMPLING);
+            let _percent_phase_field_of_view =
+                get_tag_string(&dcm_object, tags::PERCENT_PHASE_FIELD_OF_VIEW);
 
             if !suppress_output {
                 println!(
@@ -1442,202 +1577,42 @@ pub fn deep_scan_dicom_candidates_parallel(
 
         // If the Modality is "MR", get some additional information
         if modality == "MR" {
-            // get the TE (echo time)
-            let te = dcm_object
-                .element(tags::ECHO_TIME)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-            // get the TR (repetition time)
-            let tr = dcm_object
-                .element(tags::REPETITION_TIME)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
+            let te = get_tag_string(&dcm_object, tags::ECHO_TIME);
+            let tr = get_tag_string(&dcm_object, tags::REPETITION_TIME);
+            let sar = get_tag_string(&dcm_object, tags::SAR);
+            let _db_dt = get_tag_string(&dcm_object, tags::D_BDT);
+            let _isocenter_position = get_tag_string(&dcm_object, tags::ISOCENTER_POSITION);
+            let receive_coil_name = get_tag_string(&dcm_object, tags::RECEIVE_COIL_NAME);
+            let pixel_bandwidth = get_tag_string(&dcm_object, tags::PIXEL_BANDWIDTH);
+            let _number_pe = get_tag_string(&dcm_object, tags::NUMBER_OF_PHASE_ENCODING_STEPS);
+            let acq_matrix = get_tag_string(&dcm_object, tags::ACQUISITION_MATRIX);
+            let phase_encoding_direction =
+                get_tag_string(&dcm_object, tags::IN_PLANE_PHASE_ENCODING_DIRECTION);
+            let reconstruction_diameter =
+                get_tag_string(&dcm_object, tags::RECONSTRUCTION_DIAMETER);
+            let pixel_spacing = get_tag_string(&dcm_object, tags::PIXEL_SPACING);
+            let rows = get_tag_string(&dcm_object, tags::ROWS);
+            let columns = get_tag_string(&dcm_object, tags::COLUMNS);
 
-            // get the matrix size
+            let _b1_rms = get_tag_string(&dcm_object, tags::B1RMS);
+            let _bits_allocated = get_tag_string(&dcm_object, tags::BITS_ALLOCATED);
+            let _bits_stored = get_tag_string(&dcm_object, tags::BITS_STORED);
+            let _high_bit = get_tag_string(&dcm_object, tags::HIGH_BIT);
+            let scanning_sequence = get_tag_string(&dcm_object, tags::SCANNING_SEQUENCE);
+            let sequence_variant = get_tag_string(&dcm_object, tags::SEQUENCE_VARIANT);
+            let scan_options = get_tag_string(&dcm_object, tags::SCAN_OPTIONS);
+            let mr_acquisition_type = get_tag_string(&dcm_object, tags::MR_ACQUISITION_TYPE);
+            let _inversion_time = get_tag_string(&dcm_object, tags::INVERSION_TIME);
 
-            // get the slice thickness
+            let _sequence_name = get_tag_string(&dcm_object, tags::SEQUENCE_NAME);
+            let center_to_center_slice_gap =
+                get_tag_string(&dcm_object, tags::SPACING_BETWEEN_SLICES);
+            let percent_sampling = get_tag_string(&dcm_object, tags::PERCENT_SAMPLING);
+            let percent_phase_fov = get_tag_string(&dcm_object, tags::PERCENT_PHASE_FIELD_OF_VIEW);
+            let flip_angle = get_tag_string(&dcm_object, tags::FLIP_ANGLE);
 
-            // get the pixel spacing
-
-            // get the number of slices
-
-            // get the pixel bit depth
-
-            // get the SAR value
-            let sar = dcm_object
-                .element(tags::SAR)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            // get the dB/dt value
-            let _db_dt = dcm_object
-                .element(tags::D_BDT)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            // get the isocenter position
-            let _isocenter_position = dcm_object
-                .element(tags::ISOCENTER_POSITION)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            // get the receive coil name
-            let receive_coil_name = dcm_object
-                .element(tags::RECEIVE_COIL_NAME)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            // get the pixel bandwidth
-            let pixel_bandwidth = dcm_object
-                .element(tags::PIXEL_BANDWIDTH)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _number_pe = dcm_object
-                .element(tags::NUMBER_OF_PHASE_ENCODING_STEPS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let acq_matrix = dcm_object
-                .element(tags::ACQUISITION_MATRIX)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            // phase encoding direction, redundant with acq_matrix
-            let phase_encoding_direction = dcm_object
-                .element(tags::IN_PLANE_PHASE_ENCODING_DIRECTION)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let reconstruction_diameter = dcm_object
-                .element(tags::RECONSTRUCTION_DIAMETER)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let pixel_spacing = dcm_object
-                .element(tags::PIXEL_SPACING)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let rows = dcm_object
-                .element(tags::ROWS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let columns = dcm_object
-                .element(tags::COLUMNS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _b1_rms = dcm_object
-                .element(tags::B1RMS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _bits_allocated = dcm_object
-                .element(tags::BITS_ALLOCATED)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _bits_stored = dcm_object
-                .element(tags::BITS_STORED)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _high_bit = dcm_object
-                .element(tags::HIGH_BIT)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let scanning_sequence = dcm_object
-                .element(tags::SCANNING_SEQUENCE)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let sequence_variant = dcm_object
-                .element(tags::SEQUENCE_VARIANT)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let scan_options = dcm_object
-                .element(tags::SCAN_OPTIONS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let mr_acquisition_type = dcm_object
-                .element(tags::MR_ACQUISITION_TYPE)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _inversion_time = dcm_object
-                .element(tags::INVERSION_TIME)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _sequence_name = dcm_object
-                .element(tags::SEQUENCE_NAME)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let center_to_center_slice_gap = dcm_object
-                .element(tags::SPACING_BETWEEN_SLICES)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let percent_sampling = dcm_object
-                .element(tags::PERCENT_SAMPLING)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let percent_phase_fov = dcm_object
-                .element(tags::PERCENT_PHASE_FIELD_OF_VIEW)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let flip_angle = dcm_object
-                .element(tags::FLIP_ANGLE)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let _variable_flip_flag = dcm_object
-                .element(tags::VARIABLE_FLIP_ANGLE_FLAG)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
-
-            let slice_thickness = dcm_object
-                .element(tags::SLICE_THICKNESS)
-                .map_or("N/A".to_string(), |e| {
-                    e.value().to_str().unwrap().to_string()
-                });
+            let _variable_flip_flag = get_tag_string(&dcm_object, tags::VARIABLE_FLIP_ANGLE_FLAG);
+            let slice_thickness = get_tag_string(&dcm_object, tags::SLICE_THICKNESS);
 
             // Seems like GE does not report:
             // - dbdt
@@ -1682,11 +1657,7 @@ pub fn deep_scan_dicom_candidates_parallel(
             }
 
             if manufacturer == "GE MEDICAL SYSTEMS" {
-                let internal_sequence_name = dcm_object
-                    .element(Tag(0x0019, 0x109E))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
+                let internal_sequence_name = get_tag_string(&dcm_object, Tag(0x0019, 0x109E));
 
                 // this tag is "FL" as VR (single float)
                 let ge_acquisition_duration = dcm_object
@@ -1698,136 +1669,29 @@ pub fn deep_scan_dicom_candidates_parallel(
                     acquisition_duration = format!("{:.2}", ge_acquisition_duration);
                 }
 
-                let number_of_echoes = dcm_object
-                    .element(Tag(0x0019, 0x107E))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-                let _table_delta = dcm_object
-                    .element(Tag(0x0019, 0x107F))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
+                let number_of_echoes = get_tag_string(&dcm_object, Tag(0x0019, 0x107E));
+                let _table_delta = get_tag_string(&dcm_object, Tag(0x0019, 0x107F));
+                let _gehc_private_creator_id = get_tag_string(&dcm_object, Tag(0x0043, 0x0010));
+                let _bitmap_of_prescan_options = get_tag_string(&dcm_object, Tag(0x0043, 0x1001));
+                let _gradient_offset_x = get_tag_string(&dcm_object, Tag(0x0043, 0x1002));
+                let _gradient_offset_y = get_tag_string(&dcm_object, Tag(0x0043, 0x1003));
+                let _gradient_offset_z = get_tag_string(&dcm_object, Tag(0x0043, 0x1004));
 
-                let _gehc_private_creator_id = dcm_object
-                    .element(Tag(0x0043, 0x0010))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _bitmap_of_prescan_options = dcm_object
-                    .element(Tag(0x0043, 0x1001))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _gradient_offset_x = dcm_object
-                    .element(Tag(0x0043, 0x1002))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _gradient_offset_y = dcm_object
-                    .element(Tag(0x0043, 0x1003))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _gradient_offset_z = dcm_object
-                    .element(Tag(0x0043, 0x1004))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _image_is_original = dcm_object
-                    .element(Tag(0x0043, 0x1005))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _number_of_epi_shots = dcm_object
-                    .element(Tag(0x0043, 0x1006))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _views_per_segment = dcm_object
-                    .element(Tag(0x0043, 0x1007))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _respiratory_rate_bpm = dcm_object
-                    .element(Tag(0x0043, 0x1008))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _respiratory_trigger_point = dcm_object
-                    .element(Tag(0x0043, 0x1009))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _type_of_receiver_used = dcm_object
-                    .element(Tag(0x0043, 0x100A))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _peak_dbdt = dcm_object
-                    .element(Tag(0x0043, 0x100B))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _dbdt_limits_percent = dcm_object
-                    .element(Tag(0x0043, 0x100C))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _psd_estimatated_limit = dcm_object
-                    .element(Tag(0x0043, 0x100D))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _psd_estimated_limit_tps = dcm_object
-                    .element(Tag(0x0043, 0x100E))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _sar_avg_head = dcm_object
-                    .element(Tag(0x0043, 0x100F))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _application_name = dcm_object
-                    .element(Tag(0x0043, 0x1077))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _application_version = dcm_object
-                    .element(Tag(0x0043, 0x1078))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let _slices_per_volume = dcm_object
-                    .element(Tag(0x0043, 0x1079))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
-
-                let asset_r_factors = dcm_object
-                    .element(Tag(0x0043, 0x1083))
-                    .map_or("N/A".to_string(), |e| {
-                        e.value().to_str().unwrap().to_string()
-                    });
+                let _image_is_original = get_tag_string(&dcm_object, Tag(0x0043, 0x1005));
+                let _number_of_epi_shots = get_tag_string(&dcm_object, Tag(0x0043, 0x1006));
+                let _views_per_segment = get_tag_string(&dcm_object, Tag(0x0043, 0x1007));
+                let _respiratory_rate_bpm = get_tag_string(&dcm_object, Tag(0x0043, 0x1008));
+                let _respiratory_trigger_point = get_tag_string(&dcm_object, Tag(0x0043, 0x1009));
+                let _type_of_receiver_used = get_tag_string(&dcm_object, Tag(0x0043, 0x100A));
+                let _peak_dbdt = get_tag_string(&dcm_object, Tag(0x0043, 0x100B));
+                let _dbdt_limits_percent = get_tag_string(&dcm_object, Tag(0x0043, 0x100C));
+                let _psd_estimatated_limit = get_tag_string(&dcm_object, Tag(0x0043, 0x100D));
+                let _psd_estimated_limit_tps = get_tag_string(&dcm_object, Tag(0x0043, 0x100E));
+                let _sar_avg_head = get_tag_string(&dcm_object, Tag(0x0043, 0x100F));
+                let _application_name = get_tag_string(&dcm_object, Tag(0x0043, 0x1077));
+                let _application_version = get_tag_string(&dcm_object, Tag(0x0043, 0x1078));
+                let _slices_per_volume = get_tag_string(&dcm_object, Tag(0x0043, 0x1079));
+                let asset_r_factors = get_tag_string(&dcm_object, Tag(0x0043, 0x1083));
 
                 // Use GE Asset R factors for parallel imaging factor if not already set
                 if parallel_imaging_factor == "N/A" && asset_r_factors != "N/A" {
@@ -2328,6 +2192,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cand.manufacturer,
             cand.study_instance_uid,
             cand.series_instance_uid
+        );
+    }
+
+    // Extract XProtocol data if --xprot directory is specified
+    if let Some(xprot_dir) = args.xprot {
+        println!("\n--- Extracting XProtocol data from Siemens DICOM files ---");
+        let xprot_count = extract_xprotocol_from_zip(&arc_data, &xprot_dir)?;
+        println!(
+            "Extracted {} XProtocol file(s) to {}",
+            xprot_count,
+            xprot_dir.display()
         );
     }
 

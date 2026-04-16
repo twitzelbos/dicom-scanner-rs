@@ -16,7 +16,11 @@ A high-performance Rust-based DICOM file scanner that processes ZIP archives con
 ```
 dicom_scanner/
 ├── src/
-│   └── main.rs              # Single source file (1,766 lines)
+│   └── main.rs              # Single source file
+├── dump-siemens/            # READONLY REFERENCE - Siemens XProtocol extraction prototype
+│   ├── src/main.rs          # Reference implementation (CSA parsing, SQ traversal, XProtocol extraction)
+│   ├── Cargo.toml
+│   └── 0001.dcm             # Sample Siemens DICOM file (not committed)
 ├── sample-archive/          # Test DICOM data (~500+ files)
 │   ├── SER00001-SER00005/  # Series directories
 │   ├── README.txt
@@ -28,6 +32,13 @@ dicom_scanner/
 ├── DICOMDIR                # Raw DICOM directory file
 └── *.zip                   # Test archives
 ```
+
+### dump-siemens/ (Readonly Reference)
+This subdirectory is a standalone Rust prototype used as a **readonly reference** for Siemens-specific DICOM features. Do not modify it — it exists to document the algorithms that were integrated into the main scanner. Key implementations:
+- **CSA header parsing**: Decodes `SV10` binary format from Siemens private tags
+- **Raw DICOM sequence parsing**: Byte-level SQ traversal with explicit/implicit VR handling
+- **Recursive tag extraction**: Walks the full DICOM object tree through nested sequences
+- **XProtocol extraction**: Extracts protocol data from tags `(0021,1019)` and `(0021,10fe)`
 
 ## Core Functionality
 
@@ -73,6 +84,13 @@ dicom_scanner/
 - Tags range: 0x0043,0x0010 to 0x0043,0x10BF
 - Includes SAR, dB/dt, gradient parameters, coil information
 
+#### Siemens XProtocol Extraction
+- **CSA Header Parser** (`parse_csa_header`): Decodes Siemens SV10 binary format
+- **DICOM Sequence Parser** (`parse_dicom_sequence`): Raw byte-level SQ parsing with explicit/implicit VR
+- **Recursive Tag Search** (`extract_tag_recursive`): Walks the full DICOM object tree through nested SQ elements
+- **XProtocol Extraction** (`extract_xprotocol_from_zip`): Extracts protocol data from Siemens private tags (0021,1019) and (0021,10fe)
+- Outputs `.xprot` files organized by series description
+
 ### 4. MR Imaging Support
 Extensive extraction of MR-specific parameters:
 - Echo Time (TE), Repetition Time (TR)
@@ -91,11 +109,15 @@ dicom_scanner -f <ZIP_PATH>
 
 # Output only MRN (Medical Record Number)
 dicom_scanner --file <ZIP_PATH> --mrn
+
+# Extract XProtocol data from Siemens DICOM files
+dicom_scanner --file <ZIP_PATH> --xprot <OUTPUT_DIR>
 ```
 
 ### Options
 - `--file` or `-f`: Path to ZIP file containing DICOM files (required)
 - `--mrn`: Output only the MRN (Patient ID) from the DICOM files
+- `--xprot`: Extract Siemens XProtocol data to the specified output directory
 
 When using `--mrn`:
 - Only unique patient IDs are output (one per line)
@@ -189,6 +211,18 @@ When using `--mrn`:
    - Added derivation tracking: DerivationDescription, ReferencedSeriesSequence
    - Calculates FOV from pixel spacing and matrix size
    - These fields are used for creating human-readable folder names and CSV export
+
+### 2026-04-16
+1. **Added Siemens XProtocol extraction (`--xprot`)**:
+   - CSA header parser for SV10 binary format
+   - Raw DICOM sequence byte-level parser
+   - Recursive tag search through nested SQ elements
+   - Extracts XProtocol from Siemens private tags (0021,1019) and (0021,10fe)
+   - Outputs `.xprot` files per series to a specified directory
+   - Deduplicates by series (one .xprot per unique series)
+2. **Added `dump-siemens/` as readonly reference**:
+   - Prototype implementation used as algorithm reference
+   - Not to be modified — documents the source of Siemens parsing logic
 
 ## Notes
 - Project appears to be in active development
