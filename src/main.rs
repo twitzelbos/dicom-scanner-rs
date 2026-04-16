@@ -40,6 +40,10 @@ struct Args {
     /// Output directory to extract XProtocol data from Siemens DICOM files
     #[arg(long)]
     xprot: Option<PathBuf>,
+
+    /// Analyze derivation relationships between DICOM series
+    #[arg(long)]
+    derivations: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1293,6 +1297,546 @@ pub fn get_tag_string(obj: &InMemDicomObject<StandardDataDictionary>, tag: Tag) 
     "N/A".to_string()
 }
 
+#[derive(Debug, Clone)]
+struct DerivationCode {
+    code_value: String,
+    coding_scheme: String,
+    code_meaning: String,
+}
+
+#[derive(Debug, Clone)]
+struct SeriesDerivationInfo {
+    series_instance_uid: String,
+    #[allow(dead_code)]
+    series_description: String,
+    series_number: String,
+    modality: String,
+    image_type: String,
+    is_derived: bool,
+    file_count: usize,
+    derivation_description: String,
+    derivation_codes: Vec<DerivationCode>,
+    frame_of_reference_uid: String,
+    referenced_series_uids: Vec<String>,
+    source_sop_uids: Vec<String>,
+    referenced_image_sop_uids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DerivationEdge {
+    source_series_uid: String,
+    evidence_tags: Vec<&'static str>,
+}
+
+fn extract_all_from_sq(
+    obj: &InMemDicomObject<StandardDataDictionary>,
+    sq_tag: Tag,
+    inner_tag: Tag,
+) -> Vec<String> {
+    let mut results = Vec::new();
+    if let Ok(sq_element) = obj.element(sq_tag)
+        && let Value::Sequence(sequence) = sq_element.value()
+    {
+        for item in sequence.items() {
+            if let Ok(inner_element) = item.element(inner_tag)
+                && let Ok(s) = inner_element.value().to_str()
+            {
+                let trimmed = s.trim().to_string();
+                if !trimmed.is_empty() {
+                    results.push(trimmed);
+                }
+            }
+        }
+    }
+    results
+}
+
+fn extract_derivation_codes(obj: &InMemDicomObject<StandardDataDictionary>) -> Vec<DerivationCode> {
+    let mut codes = Vec::new();
+    if let Ok(sq_element) = obj.element(tags::DERIVATION_CODE_SEQUENCE)
+        && let Value::Sequence(sequence) = sq_element.value()
+    {
+        for item in sequence.items() {
+            let code_value = item
+                .element(tags::CODE_VALUE)
+                .map_or("N/A".to_string(), |e| {
+                    e.value().to_str().unwrap_or_default().trim().to_string()
+                });
+            let coding_scheme = item
+                .element(tags::CODING_SCHEME_DESIGNATOR)
+                .map_or("N/A".to_string(), |e| {
+                    e.value().to_str().unwrap_or_default().trim().to_string()
+                });
+            let code_meaning = item
+                .element(tags::CODE_MEANING)
+                .map_or("N/A".to_string(), |e| {
+                    e.value().to_str().unwrap_or_default().trim().to_string()
+                });
+            codes.push(DerivationCode {
+                code_value,
+                coding_scheme,
+                code_meaning,
+            });
+        }
+    }
+    codes
+}
+
+fn format_series_label(
+    uid: &str,
+    descriptions: &std::collections::HashMap<String, String>,
+    numbers: &std::collections::HashMap<String, String>,
+) -> String {
+    let desc = descriptions.get(uid).map(|s| s.as_str()).unwrap_or("N/A");
+    let num = numbers.get(uid).map(|s| s.as_str()).unwrap_or("?");
+    let short_uid = uid.split('.').next_back().unwrap_or(uid);
+    format!(
+        "Series {} \"{}\" [...{}]",
+        num,
+        desc,
+        &short_uid[..8.min(short_uid.len())]
+    )
+}
+
+/// Parse DICOM objects from either a ZIP archive or a directory of DICOM files.
+/// Returns a Vec of parsed DICOM objects.
+fn load_dicom_objects(
+    input_path: &Path,
+) -> Result<Vec<InMemDicomObject<StandardDataDictionary>>, Box<dyn std::error::Error>> {
+    let mut objects = Vec::new();
+
+    if input_path.is_dir() {
+        fn visit_dir(
+            dir: &Path,
+            objects: &mut Vec<InMemDicomObject<StandardDataDictionary>>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    visit_dir(&path, objects)?;
+                } else if let Ok(obj) = OpenFileOptions::new()
+                    .read_until(tags::PIXEL_DATA)
+                    .open_file(&path)
+                {
+                    objects.push(obj.into_inner());
+                }
+            }
+            Ok(())
+        }
+        visit_dir(input_path, &mut objects)?;
+    } else {
+        // Try as ZIP first, fall back to single DICOM file
+        let mut file_data = Vec::new();
+        std::fs::File::open(input_path)?.read_to_end(&mut file_data)?;
+
+        if let Ok(mut archive) = ZipArchive::new(Cursor::new(&file_data)) {
+            for i in 0..archive.len() {
+                let file = match archive.by_index(i) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if file.size() < 132 || file.is_dir() {
+                    continue;
+                }
+                if let Ok(obj) = OpenFileOptions::new()
+                    .read_until(tags::PIXEL_DATA)
+                    .from_reader(file)
+                {
+                    objects.push(obj.into_inner());
+                }
+            }
+        } else if let Ok(obj) = OpenFileOptions::new()
+            .read_until(tags::PIXEL_DATA)
+            .open_file(input_path)
+        {
+            objects.push(obj.into_inner());
+        }
+    }
+
+    Ok(objects)
+}
+
+pub fn analyze_derivations(input_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{HashMap, HashSet};
+
+    println!("Loading DICOM files from {}...", input_path.display());
+    let objects = load_dicom_objects(input_path)?;
+    println!("Parsed {} DICOM files", objects.len());
+
+    // Pass 1: Build SOP→Series map and collect representative per series
+    let mut sop_to_series: HashMap<String, String> = HashMap::new();
+    let mut series_file_counts: HashMap<String, usize> = HashMap::new();
+    let mut series_representatives: HashMap<String, usize> = HashMap::new(); // series_uid → index in objects
+    let mut series_descriptions: HashMap<String, String> = HashMap::new();
+    let mut series_numbers: HashMap<String, String> = HashMap::new();
+
+    for (idx, dcm_object) in objects.iter().enumerate() {
+        let sop_uid = get_tag_string(dcm_object, tags::SOP_INSTANCE_UID);
+        let series_uid = get_tag_string(dcm_object, tags::SERIES_INSTANCE_UID);
+
+        if sop_uid != "N/A" && series_uid != "N/A" {
+            sop_to_series.insert(sop_uid, series_uid.clone());
+        }
+
+        *series_file_counts.entry(series_uid.clone()).or_insert(0) += 1;
+
+        if let std::collections::hash_map::Entry::Vacant(e) =
+            series_representatives.entry(series_uid.clone())
+        {
+            series_descriptions.insert(
+                series_uid.clone(),
+                get_tag_string(dcm_object, tags::SERIES_DESCRIPTION),
+            );
+            series_numbers.insert(series_uid, get_tag_string(dcm_object, tags::SERIES_NUMBER));
+            e.insert(idx);
+        }
+    }
+
+    println!(
+        "Found {} series across {} files\n",
+        series_representatives.len(),
+        objects.len()
+    );
+
+    // Pass 2: Extract derivation info per series
+    let mut derivation_infos: Vec<SeriesDerivationInfo> = Vec::new();
+
+    for (series_uid, &obj_idx) in &series_representatives {
+        let dcm_object = &objects[obj_idx];
+
+        let image_type = get_tag_string(dcm_object, tags::IMAGE_TYPE);
+        let is_derived = image_type
+            .split('\\')
+            .next()
+            .map(|s| s.trim().eq_ignore_ascii_case("DERIVED"))
+            .unwrap_or(false);
+
+        let derivation_description = get_tag_string(dcm_object, tags::DERIVATION_DESCRIPTION);
+        let derivation_codes = extract_derivation_codes(dcm_object);
+        let frame_of_reference_uid = get_tag_string(dcm_object, tags::FRAME_OF_REFERENCE_UID);
+        let modality = get_tag_string(dcm_object, tags::MODALITY);
+
+        let referenced_series_uids = extract_all_from_sq(
+            dcm_object,
+            tags::REFERENCED_SERIES_SEQUENCE,
+            tags::SERIES_INSTANCE_UID,
+        );
+
+        let source_sop_uids = extract_all_from_sq(
+            dcm_object,
+            tags::SOURCE_IMAGE_SEQUENCE,
+            tags::REFERENCED_SOP_INSTANCE_UID,
+        );
+
+        let referenced_image_sop_uids = extract_all_from_sq(
+            dcm_object,
+            tags::REFERENCED_IMAGE_SEQUENCE,
+            tags::REFERENCED_SOP_INSTANCE_UID,
+        );
+
+        derivation_infos.push(SeriesDerivationInfo {
+            series_instance_uid: series_uid.clone(),
+            series_description: series_descriptions
+                .get(series_uid)
+                .cloned()
+                .unwrap_or_default(),
+            series_number: series_numbers.get(series_uid).cloned().unwrap_or_default(),
+            modality,
+            image_type,
+            is_derived,
+            file_count: *series_file_counts.get(series_uid).unwrap_or(&0),
+            derivation_description,
+            derivation_codes,
+            frame_of_reference_uid,
+            referenced_series_uids,
+            source_sop_uids,
+            referenced_image_sop_uids,
+        });
+    }
+
+    // Sort by series number
+    derivation_infos
+        .sort_by_key(|info| info.series_number.trim().parse::<i32>().unwrap_or(i32::MAX));
+
+    // Phase 3: Build derivation graph
+    let mut derivation_graph: HashMap<String, Vec<DerivationEdge>> = HashMap::new();
+    let mut unresolved_sops: HashMap<String, Vec<String>> = HashMap::new();
+
+    for info in &derivation_infos {
+        let mut edges: Vec<DerivationEdge> = Vec::new();
+
+        // Direct series references
+        for ref_series_uid in &info.referenced_series_uids {
+            if ref_series_uid != &info.series_instance_uid {
+                edges.push(DerivationEdge {
+                    source_series_uid: ref_series_uid.clone(),
+                    evidence_tags: vec!["ReferencedSeriesSequence (0008,1115)"],
+                });
+            }
+        }
+
+        // SOP → Series for SourceImageSequence
+        let mut source_series: HashSet<String> = HashSet::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        for sop_uid in &info.source_sop_uids {
+            if let Some(series_uid) = sop_to_series.get(sop_uid) {
+                if series_uid != &info.series_instance_uid {
+                    source_series.insert(series_uid.clone());
+                }
+            } else {
+                unresolved.push(sop_uid.clone());
+            }
+        }
+        for series_uid in source_series {
+            if let Some(existing) = edges.iter_mut().find(|e| e.source_series_uid == series_uid) {
+                if !existing
+                    .evidence_tags
+                    .contains(&"SourceImageSequence (0008,2112)")
+                {
+                    existing
+                        .evidence_tags
+                        .push("SourceImageSequence (0008,2112)");
+                }
+            } else {
+                edges.push(DerivationEdge {
+                    source_series_uid: series_uid,
+                    evidence_tags: vec!["SourceImageSequence (0008,2112)"],
+                });
+            }
+        }
+
+        // SOP → Series for ReferencedImageSequence
+        let mut ref_img_series: HashSet<String> = HashSet::new();
+        for sop_uid in &info.referenced_image_sop_uids {
+            if let Some(series_uid) = sop_to_series.get(sop_uid) {
+                if series_uid != &info.series_instance_uid {
+                    ref_img_series.insert(series_uid.clone());
+                }
+            } else {
+                unresolved.push(sop_uid.clone());
+            }
+        }
+        for series_uid in ref_img_series {
+            if let Some(existing) = edges.iter_mut().find(|e| e.source_series_uid == series_uid) {
+                if !existing
+                    .evidence_tags
+                    .contains(&"ReferencedImageSequence (0008,1140)")
+                {
+                    existing
+                        .evidence_tags
+                        .push("ReferencedImageSequence (0008,1140)");
+                }
+            } else {
+                edges.push(DerivationEdge {
+                    source_series_uid: series_uid,
+                    evidence_tags: vec!["ReferencedImageSequence (0008,1140)"],
+                });
+            }
+        }
+
+        if !unresolved.is_empty() {
+            unresolved_sops.insert(info.series_instance_uid.clone(), unresolved);
+        }
+
+        if !edges.is_empty() {
+            derivation_graph.insert(info.series_instance_uid.clone(), edges);
+        }
+    }
+
+    // Phase 4: Output report
+
+    println!("=== DICOM Derivation Analysis ===\n");
+
+    // Series overview
+    println!("--- Series Overview ---");
+    for info in &derivation_infos {
+        let tag = if info.is_derived { "D" } else { "O" };
+        let label = format_series_label(
+            &info.series_instance_uid,
+            &series_descriptions,
+            &series_numbers,
+        );
+        println!(
+            "  [{}] {}  ({} files, {})",
+            tag, label, info.file_count, info.modality
+        );
+        println!("      ImageType: {}", info.image_type);
+        if info.derivation_description != "N/A" && !info.derivation_description.is_empty() {
+            println!(
+                "      DerivationDescription (0008,2111): {}",
+                info.derivation_description
+            );
+        }
+        for code in &info.derivation_codes {
+            println!(
+                "      DerivationCode (0008,9215): {} ({}) \"{}\"",
+                code.code_value, code.coding_scheme, code.code_meaning
+            );
+        }
+        if !info.source_sop_uids.is_empty() {
+            println!(
+                "      SourceImageSequence (0008,2112): {} SOP references",
+                info.source_sop_uids.len()
+            );
+        }
+        if !info.referenced_image_sop_uids.is_empty() {
+            println!(
+                "      ReferencedImageSequence (0008,1140): {} SOP references",
+                info.referenced_image_sop_uids.len()
+            );
+        }
+        if !info.referenced_series_uids.is_empty() {
+            println!(
+                "      ReferencedSeriesSequence (0008,1115): {:?}",
+                info.referenced_series_uids
+            );
+        }
+        if info.frame_of_reference_uid != "N/A" {
+            let short_for = info
+                .frame_of_reference_uid
+                .split('.')
+                .next_back()
+                .unwrap_or(&info.frame_of_reference_uid);
+            println!("      FrameOfReference: ...{}", short_for);
+        }
+        println!();
+    }
+
+    // Derivation graph (derived → sources)
+    let has_any_derived = derivation_infos.iter().any(|i| i.is_derived);
+    if has_any_derived {
+        println!("--- Derivation Map (derived <- source) ---");
+        for info in &derivation_infos {
+            if !info.is_derived {
+                continue;
+            }
+            let label = format_series_label(
+                &info.series_instance_uid,
+                &series_descriptions,
+                &series_numbers,
+            );
+            println!("  {}", label);
+
+            if let Some(edges) = derivation_graph.get(&info.series_instance_uid) {
+                for edge in edges {
+                    let source_label = format_series_label(
+                        &edge.source_series_uid,
+                        &series_descriptions,
+                        &series_numbers,
+                    );
+                    println!("    <- {}", source_label);
+                    println!("       via: {}", edge.evidence_tags.join(", "));
+                }
+            }
+
+            if let Some(unresolved) = unresolved_sops.get(&info.series_instance_uid) {
+                println!(
+                    "    <- {} unresolved external SOP reference(s) not in this dataset",
+                    unresolved.len()
+                );
+                println!(
+                    "       via: SourceImageSequence (0008,2112) / ReferencedImageSequence (0008,1140)"
+                );
+            }
+
+            let total_refs = info.source_sop_uids.len() + info.referenced_image_sop_uids.len();
+            if total_refs == 0
+                && info.referenced_series_uids.is_empty()
+                && !unresolved_sops.contains_key(&info.series_instance_uid)
+            {
+                println!("    (no explicit derivation references found in DICOM tags)");
+                println!("    ImageType indicates DERIVED — likely inline reconstruction");
+            }
+
+            println!();
+        }
+    }
+
+    // Dependency tree (source → derived)
+    println!("--- Dependency Tree (source -> derived) ---");
+    let mut source_to_derived: HashMap<String, Vec<(String, Vec<&'static str>)>> = HashMap::new();
+    for (derived_uid, edges) in &derivation_graph {
+        for edge in edges {
+            source_to_derived
+                .entry(edge.source_series_uid.clone())
+                .or_default()
+                .push((derived_uid.clone(), edge.evidence_tags.clone()));
+        }
+    }
+
+    for info in &derivation_infos {
+        let has_sources = derivation_graph.contains_key(&info.series_instance_uid);
+        let has_derivatives = source_to_derived.contains_key(&info.series_instance_uid);
+
+        if has_derivatives {
+            let label = format_series_label(
+                &info.series_instance_uid,
+                &series_descriptions,
+                &series_numbers,
+            );
+            let tag = if info.is_derived {
+                "DERIVED"
+            } else {
+                "ORIGINAL"
+            };
+            println!("  {} [{}]", label, tag);
+            if let Some(derivatives) = source_to_derived.get(&info.series_instance_uid) {
+                let mut sorted_derivs = derivatives.clone();
+                sorted_derivs.sort_by_key(|(uid, _)| {
+                    series_numbers
+                        .get(uid)
+                        .and_then(|n| n.trim().parse::<i32>().ok())
+                        .unwrap_or(i32::MAX)
+                });
+                for (derived_uid, evidence) in &sorted_derivs {
+                    let derived_label =
+                        format_series_label(derived_uid, &series_descriptions, &series_numbers);
+                    println!("    -> {} via {}", derived_label, evidence.join(", "));
+                }
+            }
+        } else if !has_sources {
+            let label = format_series_label(
+                &info.series_instance_uid,
+                &series_descriptions,
+                &series_numbers,
+            );
+            let tag = if info.is_derived {
+                "DERIVED"
+            } else {
+                "ORIGINAL"
+            };
+            println!("  {} [{}] (no derivation links)", label, tag);
+        }
+    }
+
+    // Frame of Reference groups
+    println!("\n--- Frame of Reference Groups ---");
+    let mut for_groups: HashMap<String, Vec<String>> = HashMap::new();
+    for info in &derivation_infos {
+        if info.frame_of_reference_uid != "N/A" {
+            for_groups
+                .entry(info.frame_of_reference_uid.clone())
+                .or_default()
+                .push(info.series_instance_uid.clone());
+        }
+    }
+    for (for_uid, series_uids) in &for_groups {
+        let short_for = for_uid.split('.').next_back().unwrap_or(for_uid);
+        let labels: Vec<String> = series_uids
+            .iter()
+            .map(|uid| {
+                let num = series_numbers.get(uid).map(|s| s.as_str()).unwrap_or("?");
+                format!("S{}", num.trim())
+            })
+            .collect();
+        println!("  FoR ...{}: {}", short_for, labels.join(", "));
+    }
+
+    println!();
+    Ok(())
+}
+
 pub fn extract_xprotocol_from_zip(
     zip_bytes: &[u8],
     output_dir: &Path,
@@ -2100,6 +2644,12 @@ fn sanitize_filename(s: &str) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let zip_path = args.file;
+
+    // --derivations works with both ZIP files and directories
+    if args.derivations {
+        analyze_derivations(&zip_path)?;
+        return Ok(());
+    }
 
     let start = Instant::now();
     // Open the ZIP archive and load into memory

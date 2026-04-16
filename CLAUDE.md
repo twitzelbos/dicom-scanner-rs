@@ -118,6 +118,7 @@ dicom_scanner --file <ZIP_PATH> --xprot <OUTPUT_DIR>
 - `--file` or `-f`: Path to ZIP file containing DICOM files (required)
 - `--mrn`: Output only the MRN (Patient ID) from the DICOM files
 - `--xprot`: Extract Siemens XProtocol data to the specified output directory
+- `--derivations`: Analyze derivation relationships between series (works with ZIP or directory)
 
 When using `--mrn`:
 - Only unique patient IDs are output (one per line)
@@ -220,7 +221,15 @@ When using `--mrn`:
    - Extracts XProtocol from Siemens private tags (0021,1019) and (0021,10fe)
    - Outputs `.xprot` files per series to a specified directory
    - Deduplicates by series (one .xprot per unique series)
-2. **Added `dump-siemens/` as readonly reference**:
+3. **Added `--derivations` option**:
+   - Analyzes ORIGINAL vs DERIVED series via ImageType (0008,0008)
+   - Traces derivation links through SourceImageSequence (0008,2112), ReferencedSeriesSequence (0008,1115), ReferencedImageSequence (0008,1140)
+   - Extracts DerivationDescription and DerivationCodeSequence metadata
+   - Resolves SOP-level references back to series via SOP→Series lookup
+   - Reports unresolved external references when source series not in dataset
+   - Shows dependency tree, Frame of Reference groups
+   - Works with ZIP archives, directories, or single DICOM files
+4. **Added `dump-siemens/` as readonly reference**:
    - Prototype implementation used as algorithm reference
    - Not to be modified — documents the source of Siemens parsing logic
 
