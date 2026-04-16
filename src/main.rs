@@ -1351,6 +1351,38 @@ fn extract_all_from_sq(
     results
 }
 
+fn extract_all_from_sq_deep(
+    obj: &InMemDicomObject<StandardDataDictionary>,
+    sq_tag: Tag,
+    inner_tag: Tag,
+) -> Vec<String> {
+    let mut results = Vec::new();
+    if let Ok(sq_element) = obj.element(sq_tag)
+        && let Value::Sequence(sequence) = sq_element.value()
+    {
+        for item in sequence.items() {
+            if let Ok(inner_element) = item.element(inner_tag)
+                && let Ok(s) = inner_element.value().to_str()
+            {
+                let trimmed = s.trim().to_string();
+                if !trimmed.is_empty() {
+                    results.push(trimmed);
+                }
+            }
+        }
+    }
+    for element in obj.iter() {
+        if element.vr() == VR::SQ
+            && let Value::Sequence(sequence) = element.value()
+        {
+            for item in sequence.items() {
+                results.extend(extract_all_from_sq_deep(item, sq_tag, inner_tag));
+            }
+        }
+    }
+    results
+}
+
 fn extract_derivation_codes(obj: &InMemDicomObject<StandardDataDictionary>) -> Vec<DerivationCode> {
     let mut codes = Vec::new();
     if let Ok(sq_element) = obj.element(tags::DERIVATION_CODE_SEQUENCE)
@@ -1377,6 +1409,15 @@ fn extract_derivation_codes(obj: &InMemDicomObject<StandardDataDictionary>) -> V
                 coding_scheme,
                 code_meaning,
             });
+        }
+    }
+    for element in obj.iter() {
+        if element.vr() == VR::SQ
+            && let Value::Sequence(sequence) = element.value()
+        {
+            for item in sequence.items() {
+                codes.extend(extract_derivation_codes(item));
+            }
         }
     }
     codes
@@ -1499,7 +1540,16 @@ pub fn analyze_derivations(input_path: &Path) -> Result<(), Box<dyn std::error::
         objects.len()
     );
 
-    // Pass 2: Extract derivation info per series
+    // Build series → file indices map for aggregation
+    let mut series_files: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, dcm_object) in objects.iter().enumerate() {
+        let series_uid = get_tag_string(dcm_object, tags::SERIES_INSTANCE_UID);
+        if series_uid != "N/A" {
+            series_files.entry(series_uid).or_default().push(idx);
+        }
+    }
+
+    // Pass 2: Extract derivation info per series (aggregate across ALL files)
     let mut derivation_infos: Vec<SeriesDerivationInfo> = Vec::new();
 
     for (series_uid, &obj_idx) in &series_representatives {
@@ -1517,23 +1567,41 @@ pub fn analyze_derivations(input_path: &Path) -> Result<(), Box<dyn std::error::
         let frame_of_reference_uid = get_tag_string(dcm_object, tags::FRAME_OF_REFERENCE_UID);
         let modality = get_tag_string(dcm_object, tags::MODALITY);
 
-        let referenced_series_uids = extract_all_from_sq(
-            dcm_object,
-            tags::REFERENCED_SERIES_SEQUENCE,
-            tags::SERIES_INSTANCE_UID,
-        );
+        let mut referenced_series_uids = Vec::new();
+        let mut source_sop_uids = Vec::new();
+        let mut referenced_image_sop_uids = Vec::new();
 
-        let source_sop_uids = extract_all_from_sq(
-            dcm_object,
-            tags::SOURCE_IMAGE_SEQUENCE,
-            tags::REFERENCED_SOP_INSTANCE_UID,
-        );
+        let fallback = vec![obj_idx];
+        let file_indices = series_files
+            .get(series_uid.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&fallback);
 
-        let referenced_image_sop_uids = extract_all_from_sq(
-            dcm_object,
-            tags::REFERENCED_IMAGE_SEQUENCE,
-            tags::REFERENCED_SOP_INSTANCE_UID,
-        );
+        for &fidx in file_indices {
+            let obj = &objects[fidx];
+            referenced_series_uids.extend(extract_all_from_sq(
+                obj,
+                tags::REFERENCED_SERIES_SEQUENCE,
+                tags::SERIES_INSTANCE_UID,
+            ));
+            source_sop_uids.extend(extract_all_from_sq_deep(
+                obj,
+                tags::SOURCE_IMAGE_SEQUENCE,
+                tags::REFERENCED_SOP_INSTANCE_UID,
+            ));
+            referenced_image_sop_uids.extend(extract_all_from_sq(
+                obj,
+                tags::REFERENCED_IMAGE_SEQUENCE,
+                tags::REFERENCED_SOP_INSTANCE_UID,
+            ));
+        }
+
+        referenced_series_uids.sort();
+        referenced_series_uids.dedup();
+        source_sop_uids.sort();
+        source_sop_uids.dedup();
+        referenced_image_sop_uids.sort();
+        referenced_image_sop_uids.dedup();
 
         derivation_infos.push(SeriesDerivationInfo {
             series_instance_uid: series_uid.clone(),
@@ -1644,7 +1712,152 @@ pub fn analyze_derivations(input_path: &Path) -> Result<(), Box<dyn std::error::
         }
     }
 
-    // Phase 4: Output report
+    // Phase 4: Phantom source analysis — cluster unresolved SOPs to find sibling series
+    // Build reverse index: unresolved SOP → set of series that reference it
+    let mut sop_to_referencing_series: HashMap<String, Vec<String>> = HashMap::new();
+    for (series_uid, sops) in &unresolved_sops {
+        for sop in sops {
+            sop_to_referencing_series
+                .entry(sop.clone())
+                .or_default()
+                .push(series_uid.clone());
+        }
+    }
+
+    // Build a per-series set of unresolved SOPs for fast intersection
+    let unresolved_sets: HashMap<String, HashSet<String>> = unresolved_sops
+        .iter()
+        .map(|(uid, sops)| (uid.clone(), sops.iter().cloned().collect()))
+        .collect();
+
+    // Find sibling groups: series pairs that share unresolved source SOPs
+    // For each pair of series with unresolved SOPs, compute intersection size
+    let series_with_unresolved: Vec<&String> = unresolved_sops.keys().collect();
+    let mut sibling_edges: Vec<(String, String, usize, usize, usize)> = Vec::new();
+
+    for (i, a) in series_with_unresolved.iter().enumerate() {
+        let set_a = &unresolved_sets[*a];
+        for b in series_with_unresolved.iter().skip(i + 1) {
+            let set_b = &unresolved_sets[*b];
+            let intersection = set_a.intersection(set_b).count();
+            if intersection > 0 {
+                sibling_edges.push((
+                    (*a).clone(),
+                    (*b).clone(),
+                    intersection,
+                    set_a.len(),
+                    set_b.len(),
+                ));
+            }
+        }
+    }
+
+    // Group series into clusters of shared phantom sources
+    // Use union-find approach: if A shares SOPs with B, and B with C, all three are in a cluster
+    let mut cluster_map: HashMap<String, usize> = HashMap::new();
+    let mut clusters: Vec<HashSet<String>> = Vec::new();
+
+    for (a, b, _shared, _size_a, _size_b) in &sibling_edges {
+        let cluster_a = cluster_map.get(a).copied();
+        let cluster_b = cluster_map.get(b).copied();
+        match (cluster_a, cluster_b) {
+            (Some(ca), Some(cb)) if ca == cb => {}
+            (Some(ca), Some(cb)) => {
+                let (keep, merge) = if ca < cb { (ca, cb) } else { (cb, ca) };
+                let merged: HashSet<String> = clusters[merge].drain().collect();
+                for uid in &merged {
+                    cluster_map.insert(uid.clone(), keep);
+                }
+                clusters[keep].extend(merged);
+            }
+            (Some(ca), None) => {
+                clusters[ca].insert(b.clone());
+                cluster_map.insert(b.clone(), ca);
+            }
+            (None, Some(cb)) => {
+                clusters[cb].insert(a.clone());
+                cluster_map.insert(a.clone(), cb);
+            }
+            (None, None) => {
+                let idx = clusters.len();
+                let mut set = HashSet::new();
+                set.insert(a.clone());
+                set.insert(b.clone());
+                clusters.push(set);
+                cluster_map.insert(a.clone(), idx);
+                cluster_map.insert(b.clone(), idx);
+            }
+        }
+    }
+
+    // Collect non-empty clusters and compute the shared SOP pool for each
+    struct PhantomSourceGroup {
+        series_uids: Vec<String>,
+        shared_sops: usize,
+        total_unique_sops: usize,
+    }
+
+    let mut phantom_groups: Vec<PhantomSourceGroup> = Vec::new();
+    let mut seen_clusters: HashSet<usize> = HashSet::new();
+    let unique_cluster_ids: HashSet<usize> = cluster_map.values().copied().collect();
+
+    for idx in unique_cluster_ids {
+        if seen_clusters.contains(&idx) || clusters[idx].is_empty() {
+            continue;
+        }
+        seen_clusters.insert(idx);
+
+        let members: Vec<String> = {
+            let mut v: Vec<String> = clusters[idx].iter().cloned().collect();
+            v.sort_by_key(|uid| {
+                series_numbers
+                    .get(uid)
+                    .and_then(|n| n.trim().parse::<i32>().ok())
+                    .unwrap_or(i32::MAX)
+            });
+            v
+        };
+
+        if members.len() < 2 {
+            continue;
+        }
+
+        // Find shared SOPs across all members (intersection)
+        let mut all_sops: HashSet<String> = HashSet::new();
+        let mut shared = unresolved_sets
+            .get(&members[0])
+            .cloned()
+            .unwrap_or_default();
+        for uid in &members {
+            if let Some(set) = unresolved_sets.get(uid) {
+                all_sops.extend(set.iter().cloned());
+                shared = shared.intersection(set).cloned().collect();
+            }
+        }
+
+        phantom_groups.push(PhantomSourceGroup {
+            series_uids: members,
+            shared_sops: shared.len(),
+            total_unique_sops: all_sops.len(),
+        });
+    }
+
+    phantom_groups.sort_by_key(|g| {
+        g.series_uids
+            .first()
+            .and_then(|uid| series_numbers.get(uid))
+            .and_then(|n| n.trim().parse::<i32>().ok())
+            .unwrap_or(i32::MAX)
+    });
+
+    // Also collect pairwise overlap details for the report
+    let mut pairwise_overlaps: HashMap<(String, String), (usize, usize, usize)> = HashMap::new();
+    for (a, b, shared, size_a, size_b) in &sibling_edges {
+        pairwise_overlaps.insert((a.clone(), b.clone()), (*shared, *size_a, *size_b));
+        pairwise_overlaps.insert((b.clone(), a.clone()), (*shared, *size_b, *size_a));
+    }
+
+    // Phase 5: Output report
 
     println!("=== DICOM Derivation Analysis ===\n");
 
@@ -1810,8 +2023,67 @@ pub fn analyze_derivations(input_path: &Path) -> Result<(), Box<dyn std::error::
         }
     }
 
+    // Shared Phantom Sources — sibling series that reference common unresolved SOPs
+    if !phantom_groups.is_empty() {
+        println!("--- Shared Phantom Sources (sibling series from common acquisition) ---");
+        for (group_idx, group) in phantom_groups.iter().enumerate() {
+            println!(
+                "  Phantom Source Group {} ({} shared SOPs, {} total unique SOPs):",
+                group_idx + 1,
+                group.shared_sops,
+                group.total_unique_sops
+            );
+            for uid in &group.series_uids {
+                let label = format_series_label(uid, &series_descriptions, &series_numbers);
+                let own_count = unresolved_sets.get(uid).map(|s| s.len()).unwrap_or(0);
+                let tag = if derivation_infos
+                    .iter()
+                    .find(|i| &i.series_instance_uid == uid)
+                    .map(|i| i.is_derived)
+                    .unwrap_or(false)
+                {
+                    "D"
+                } else {
+                    "O"
+                };
+                println!("    [{}] {} ({} source SOPs)", tag, label, own_count);
+            }
+
+            // Show pairwise overlap between first few members
+            if group.series_uids.len() <= 10 {
+                let mut shown = false;
+                for i in 0..group.series_uids.len() {
+                    for j in (i + 1)..group.series_uids.len() {
+                        let a = &group.series_uids[i];
+                        let b = &group.series_uids[j];
+                        if let Some((shared, size_a, _size_b)) =
+                            pairwise_overlaps.get(&(a.clone(), b.clone()))
+                        {
+                            if !shown {
+                                println!("    Pairwise overlap:");
+                                shown = true;
+                            }
+                            let num_a = series_numbers.get(a).map(|s| s.trim()).unwrap_or("?");
+                            let num_b = series_numbers.get(b).map(|s| s.trim()).unwrap_or("?");
+                            let pct = if *size_a > 0 {
+                                *shared * 100 / *size_a
+                            } else {
+                                0
+                            };
+                            println!(
+                                "      S{} <-> S{}: {} shared SOPs ({}%)",
+                                num_a, num_b, shared, pct
+                            );
+                        }
+                    }
+                }
+            }
+            println!();
+        }
+    }
+
     // Frame of Reference groups
-    println!("\n--- Frame of Reference Groups ---");
+    println!("--- Frame of Reference Groups ---");
     let mut for_groups: HashMap<String, Vec<String>> = HashMap::new();
     for info in &derivation_infos {
         if info.frame_of_reference_uid != "N/A" {
