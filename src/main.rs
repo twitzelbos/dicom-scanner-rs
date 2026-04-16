@@ -1,6 +1,6 @@
 use std::{
     io::{Cursor, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -30,6 +30,10 @@ struct Args {
     /// Output only the MRN (Medical Record Number) of the study
     #[arg(long)]
     mrn: bool,
+
+    /// Output directory to extract and organize DICOM files by series
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +55,31 @@ pub struct DeepDicomCandidate {
     pub manufacturer: String,
     pub modality: String,
     pub patient_id: String,
+    pub study_description: String,
+    pub series_description: String,
+    pub series_number: String,
+    pub protocol_name: String,
+    pub acquisition_type: String, // 2D or 3D
+    pub pixel_spacing: String,
+    pub slice_thickness: String,
+    pub acquisition_time: String,
+    pub rows: String,
+    pub columns: String,
+    pub repetition_time: String, // TR
+    pub echo_time: String,       // TE
+    pub inversion_time: String,  // TI
+    pub derivation_description: String,
+    pub referenced_series_uid: String, // For tracking derived series relationships
+    pub acquisition_duration: String,  // Protocol duration in seconds
+    // MR-specific technical parameters
+    pub flip_angle: String,
+    pub number_of_averages: String, // NEX
+    pub echo_train_length: String,
+    pub parallel_imaging_factor: String,
+    pub magnetic_field_strength: String,
+    // Image set information
+    pub spacing_between_slices: String,
+    pub image_type: String,
 }
 
 #[derive(Debug)]
@@ -1073,6 +1102,20 @@ pub fn deep_scan_dicom_candidates_parallel(
                 e.value().to_str().unwrap().to_string()
             });
 
+        // get the Protocol Name
+        let protocol_name = dcm_object
+            .element(tags::PROTOCOL_NAME)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // get the Study Description
+        let study_description = dcm_object
+            .element(tags::STUDY_DESCRIPTION)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
         let series_description = dcm_object
             .element(tags::SERIES_DESCRIPTION)
             .map_or("N/A".to_string(), |e| {
@@ -1100,6 +1143,155 @@ pub fn deep_scan_dicom_candidates_parallel(
         // get the Manufacturer
         let manufacturer = dcm_object
             .element(tags::MANUFACTURER)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // get the MR Acquisition Type (2D or 3D)
+        let acquisition_type = dcm_object
+            .element(tags::MR_ACQUISITION_TYPE)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // get the Acquisition Time
+        let acquisition_time = dcm_object
+            .element(tags::ACQUISITION_TIME)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // get spatial resolution parameters
+        let pixel_spacing = dcm_object
+            .element(tags::PIXEL_SPACING)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let slice_thickness = dcm_object
+            .element(tags::SLICE_THICKNESS)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let rows = dcm_object
+            .element(tags::ROWS)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let columns = dcm_object
+            .element(tags::COLUMNS)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // get MR timing parameters
+        let repetition_time = dcm_object
+            .element(tags::REPETITION_TIME)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let echo_time = dcm_object
+            .element(tags::ECHO_TIME)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let inversion_time = dcm_object
+            .element(tags::INVERSION_TIME)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // get derivation information
+        let derivation_description = dcm_object
+            .element(tags::DERIVATION_DESCRIPTION)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // Check for referenced series (source series for derived images)
+        let referenced_series_uid =
+            if let Ok(ref_series_seq) = dcm_object.element(tags::REFERENCED_SERIES_SEQUENCE) {
+                // Get the first item in the sequence
+                if let dicom::core::value::Value::Sequence(seq) = ref_series_seq.value() {
+                    if let Some(first_item) = seq.items().first() {
+                        // Get the Series Instance UID from the referenced series
+                        first_item
+                            .element(tags::SERIES_INSTANCE_UID)
+                            .map_or("N/A".to_string(), |e| {
+                                e.value().to_str().unwrap().to_string()
+                            })
+                    } else {
+                        "N/A".to_string()
+                    }
+                } else {
+                    "N/A".to_string()
+                }
+            } else {
+                "N/A".to_string()
+            };
+
+        // Get acquisition duration - try standard DICOM tag first
+        // Note: This tag is not always populated. Vendor-specific:
+        // - GE: Uses private tag (0019,105A) - handled below
+        // - Siemens: May use CSA headers or other private tags
+        // - Philips: Has their own private structure
+        let mut acquisition_duration = dcm_object
+            .element(Tag(0x0018, 0x9073))  // Standard Acquisition Duration tag
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap_or(std::borrow::Cow::Borrowed("N/A")).to_string()
+            });
+
+        // Get MR-specific technical parameters
+        let flip_angle = dcm_object
+            .element(tags::FLIP_ANGLE)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let number_of_averages = dcm_object
+            .element(tags::NUMBER_OF_AVERAGES)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let echo_train_length = dcm_object
+            .element(tags::ECHO_TRAIN_LENGTH)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // Parallel imaging factor - try common vendor-specific tags
+        // Note: Different vendors store this differently:
+        // - GE: Uses ASSET R factors in (0043,1083)
+        // - Siemens: Uses iPAT/GRAPPA info in various tags
+        // - Philips: Uses SENSE factors
+        let mut parallel_imaging_factor = dcm_object
+            .element(Tag(0x0018, 0x9069))  // Standard: Parallel Reduction Factor In-plane
+            .or_else(|_| dcm_object.element(Tag(0x0051, 0x1011)))  // Siemens: PATModeText (contains iPAT info)
+            .or_else(|_| dcm_object.element(Tag(0x0018, 0x9078)))  // Parallel Acquisition Technique
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let magnetic_field_strength = dcm_object
+            .element(tags::MAGNETIC_FIELD_STRENGTH)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        // Get image set information
+        let spacing_between_slices = dcm_object
+            .element(tags::SPACING_BETWEEN_SLICES)
+            .map_or("N/A".to_string(), |e| {
+                e.value().to_str().unwrap().to_string()
+            });
+
+        let image_type = dcm_object
+            .element(tags::IMAGE_TYPE)
             .map_or("N/A".to_string(), |e| {
                 e.value().to_str().unwrap().to_string()
             });
@@ -1497,9 +1689,14 @@ pub fn deep_scan_dicom_candidates_parallel(
                     });
 
                 // this tag is "FL" as VR (single float)
-                let acquisition_duration = dcm_object
+                let ge_acquisition_duration = dcm_object
                     .element(Tag(0x0019, 0x105A))
                     .map_or(f32::NAN, |e| e.value().to_float32().unwrap());
+
+                // If we didn't get acquisition duration from standard tag, use GE-specific one
+                if acquisition_duration == "N/A" && !ge_acquisition_duration.is_nan() {
+                    acquisition_duration = format!("{:.2}", ge_acquisition_duration);
+                }
 
                 let number_of_echoes = dcm_object
                     .element(Tag(0x0019, 0x107E))
@@ -1632,12 +1829,17 @@ pub fn deep_scan_dicom_candidates_parallel(
                         e.value().to_str().unwrap().to_string()
                     });
 
+                // Use GE Asset R factors for parallel imaging factor if not already set
+                if parallel_imaging_factor == "N/A" && asset_r_factors != "N/A" {
+                    parallel_imaging_factor = asset_r_factors.clone();
+                }
+
                 // note the acquisition duration is in micro seconds
                 if !suppress_output {
                     println!(
                         "{} {:#?} {} {}",
                         internal_sequence_name,
-                        Duration::from_micros(acquisition_duration as u64),
+                        Duration::from_micros(ge_acquisition_duration as u64),
                         number_of_echoes,
                         asset_r_factors,
                     );
@@ -1657,6 +1859,29 @@ pub fn deep_scan_dicom_candidates_parallel(
             modality,
             manufacturer,
             patient_id,
+            study_description,
+            series_description,
+            series_number,
+            protocol_name,
+            acquisition_type,
+            pixel_spacing,
+            slice_thickness,
+            acquisition_time,
+            rows,
+            columns,
+            repetition_time,
+            echo_time,
+            inversion_time,
+            derivation_description,
+            referenced_series_uid,
+            acquisition_duration,
+            flip_angle,
+            number_of_averages,
+            echo_train_length,
+            parallel_imaging_factor,
+            magnetic_field_strength,
+            spacing_between_slices,
+            image_type,
         });
     }
     Ok(all_candidates)
@@ -1708,6 +1933,304 @@ pub fn scan_dicom_candidates_parallel(
         .collect();
 
     Ok(results)
+}
+
+/// Export series metadata to CSV file
+fn export_series_metadata_csv(
+    deep_candidates: &[DeepDicomCandidate],
+    output_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::Write;
+
+    // Group files by series to get one row per series
+    let mut series_map: std::collections::HashMap<(String, String), &DeepDicomCandidate> =
+        std::collections::HashMap::new();
+
+    // For each series, we'll use the first file's metadata as representative
+    for candidate in deep_candidates {
+        let key = (
+            candidate.study_instance_uid.clone(),
+            candidate.series_instance_uid.clone(),
+        );
+        series_map.entry(key).or_insert(candidate);
+    }
+
+    // Create CSV file
+    let csv_path = output_dir.join("series_metadata.csv");
+    let mut csv_file = File::create(&csv_path)?;
+
+    // Write CSV header
+    writeln!(
+        csv_file,
+        "SeriesDescription,ProtocolName,SeriesNumber,Modality,SeriesInstanceUID,AcquisitionType,PixelSpacing,SliceThickness,SpacingBetweenSlices,FOV,TR,TE,TI,FlipAngle,NumberOfAverages,EchoTrainLength,ParallelImagingFactor,MagneticFieldStrength,ImageType,AcquisitionTime,AcquisitionDuration,DerivationDescription,ReferencedSeriesUID,FileCount"
+    )?;
+
+    // Count files per series
+    let mut series_file_count: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for candidate in deep_candidates {
+        let key = (
+            candidate.study_instance_uid.clone(),
+            candidate.series_instance_uid.clone(),
+        );
+        *series_file_count.entry(key).or_insert(0) += 1;
+    }
+
+    // Sort series by study and series for consistent output
+    let mut sorted_series: Vec<_> = series_map.into_iter().collect();
+    sorted_series.sort_by(|a, b| match a.0.0.cmp(&b.0.0) {
+        std::cmp::Ordering::Equal => a.0.1.cmp(&b.0.1),
+        other => other,
+    });
+
+    // Write data rows
+    for ((study_uid, series_uid), candidate) in sorted_series {
+        let file_count = series_file_count
+            .get(&(study_uid.clone(), series_uid.clone()))
+            .unwrap_or(&0);
+
+        // Escape fields that might contain commas or quotes
+        let escape_csv_field = |field: &str| -> String {
+            if field.contains(',') || field.contains('"') || field.contains('\n') {
+                format!("\"{}\"", field.replace("\"", "\"\""))
+            } else {
+                field.to_string()
+            }
+        };
+
+        // Calculate FOV if pixel spacing and matrix size are available
+        let fov = if candidate.pixel_spacing != "N/A"
+            && candidate.rows != "N/A"
+            && candidate.columns != "N/A"
+        {
+            // Parse pixel spacing (format: "value1\\value2")
+            let spacing_parts: Vec<&str> = candidate.pixel_spacing.split('\\').collect();
+            if spacing_parts.len() >= 2 {
+                if let (Ok(spacing_x), Ok(spacing_y), Ok(rows), Ok(cols)) = (
+                    spacing_parts[0].parse::<f32>(),
+                    spacing_parts[1].parse::<f32>(),
+                    candidate.rows.parse::<f32>(),
+                    candidate.columns.parse::<f32>(),
+                ) {
+                    format!("{:.1}x{:.1}", spacing_x * cols, spacing_y * rows)
+                } else {
+                    "N/A".to_string()
+                }
+            } else {
+                "N/A".to_string()
+            }
+        } else {
+            "N/A".to_string()
+        };
+
+        writeln!(
+            csv_file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            escape_csv_field(&candidate.series_description),
+            escape_csv_field(&candidate.protocol_name),
+            escape_csv_field(&candidate.series_number),
+            escape_csv_field(&candidate.modality),
+            escape_csv_field(&series_uid),
+            escape_csv_field(&candidate.acquisition_type),
+            escape_csv_field(&candidate.pixel_spacing),
+            escape_csv_field(&candidate.slice_thickness),
+            escape_csv_field(&candidate.spacing_between_slices),
+            escape_csv_field(&fov),
+            escape_csv_field(&candidate.repetition_time),
+            escape_csv_field(&candidate.echo_time),
+            escape_csv_field(&candidate.inversion_time),
+            escape_csv_field(&candidate.flip_angle),
+            escape_csv_field(&candidate.number_of_averages),
+            escape_csv_field(&candidate.echo_train_length),
+            escape_csv_field(&candidate.parallel_imaging_factor),
+            escape_csv_field(&candidate.magnetic_field_strength),
+            escape_csv_field(&candidate.image_type),
+            escape_csv_field(&candidate.acquisition_time),
+            escape_csv_field(&candidate.acquisition_duration),
+            escape_csv_field(&candidate.derivation_description),
+            escape_csv_field(&candidate.referenced_series_uid),
+            file_count
+        )?;
+    }
+
+    println!("\nMetadata exported to: {}", csv_path.display());
+    Ok(())
+}
+
+/// Extract and organize DICOM files from ZIP archive by series
+fn extract_and_organize_dicoms(
+    zip_bytes: &[u8],
+    deep_candidates: &[DeepDicomCandidate],
+    output_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+    use std::io::Write;
+
+    // Create output directory if it doesn't exist
+    fs::create_dir_all(output_dir)?;
+
+    // Create a map of file indices to their study/series info
+    let mut file_organization = std::collections::HashMap::new();
+    for candidate in deep_candidates {
+        file_organization.insert(
+            candidate.index,
+            (
+                candidate.study_instance_uid.clone(),
+                candidate.series_instance_uid.clone(),
+                candidate.name.clone(),
+                candidate.study_description.clone(),
+                candidate.series_description.clone(),
+                candidate.series_number.clone(),
+            ),
+        );
+    }
+
+    // Open the ZIP archive
+    let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
+
+    // Track created directories to avoid redundant filesystem calls
+    let mut created_dirs = std::collections::HashSet::new();
+
+    // Extract and organize files
+    for (index, (study_uid, series_uid, original_name, study_desc, series_desc, series_num)) in
+        file_organization
+    {
+        // Create directory structure with descriptive names
+        // Format: Study_[Description]_[ShortUID] / Series_[Number]_[Description]_[ShortUID]
+        let study_folder_name = if study_desc != "N/A" && !study_desc.is_empty() {
+            format!(
+                "Study_{}_{}",
+                sanitize_filename(&study_desc),
+                &study_uid.split('.').next_back().unwrap_or(&study_uid)
+                    [..8.min(study_uid.split('.').next_back().unwrap_or(&study_uid).len())]
+            )
+        } else {
+            format!(
+                "Study_{}",
+                &study_uid.split('.').next_back().unwrap_or(&study_uid)
+                    [..16.min(study_uid.split('.').next_back().unwrap_or(&study_uid).len())]
+            )
+        };
+
+        let series_folder_name = if series_desc != "N/A" && !series_desc.is_empty() {
+            let series_prefix = if series_num != "N/A" && !series_num.is_empty() {
+                format!(
+                    "Series_{:04}_{}",
+                    series_num.parse::<i32>().unwrap_or(0),
+                    sanitize_filename(&series_desc)
+                )
+            } else {
+                format!("Series_{}", sanitize_filename(&series_desc))
+            };
+            format!(
+                "{}_{}",
+                series_prefix,
+                &series_uid.split('.').next_back().unwrap_or(&series_uid)[..8.min(
+                    series_uid
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(&series_uid)
+                        .len()
+                )]
+            )
+        } else {
+            format!(
+                "Series_{}",
+                &series_uid.split('.').next_back().unwrap_or(&series_uid)[..16.min(
+                    series_uid
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(&series_uid)
+                        .len()
+                )]
+            )
+        };
+
+        let study_dir = output_dir.join(study_folder_name);
+        let series_dir = study_dir.join(series_folder_name);
+
+        // Create directories if not already created
+        if !created_dirs.contains(&series_dir) {
+            fs::create_dir_all(&series_dir)?;
+            created_dirs.insert(series_dir.clone());
+        }
+
+        // Extract file from ZIP
+        let mut zip_file = archive.by_index(index)?;
+
+        // Determine output filename (preserve original name if possible)
+        let file_name = PathBuf::from(&original_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("dicom_{:04}.dcm", index));
+
+        let output_path = series_dir.join(&file_name);
+
+        // Read and write file
+        let mut buffer = Vec::new();
+        std::io::copy(&mut zip_file, &mut buffer)?;
+
+        let mut output_file = fs::File::create(&output_path)?;
+        output_file.write_all(&buffer)?;
+
+        println!("Extracted: {} -> {}", original_name, output_path.display());
+    }
+
+    println!("\nExtraction complete!");
+    println!("Files organized in: {}", output_dir.display());
+
+    // Print summary of organization with descriptive names
+    type SeriesMap = std::collections::HashMap<String, (String, String)>;
+    type StudyMap = std::collections::HashMap<String, (String, SeriesMap)>;
+    let mut study_info: StudyMap = StudyMap::new();
+
+    for candidate in deep_candidates {
+        let series_info = study_info
+            .entry(candidate.study_instance_uid.clone())
+            .or_insert_with(|| {
+                (
+                    candidate.study_description.clone(),
+                    std::collections::HashMap::new(),
+                )
+            });
+
+        series_info.1.insert(
+            candidate.series_instance_uid.clone(),
+            (
+                candidate.series_description.clone(),
+                candidate.series_number.clone(),
+            ),
+        );
+    }
+
+    println!("\nOrganization summary:");
+    println!("  {} studies", study_info.len());
+    for (study_uid, (study_desc, series_map)) in &study_info {
+        let study_display = if study_desc != "N/A" && !study_desc.is_empty() {
+            study_desc.clone()
+        } else {
+            format!(
+                "UID: {}",
+                &study_uid.split('.').next_back().unwrap_or(study_uid)
+                    [..16.min(study_uid.split('.').next_back().unwrap_or(study_uid).len())]
+            )
+        };
+        println!("    Study [{}]: {} series", study_display, series_map.len());
+    }
+
+    Ok(())
+}
+
+/// Sanitize a string to be used as a filename
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1807,5 +2330,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cand.series_instance_uid
         );
     }
+
+    // Extract and organize files if output directory is specified
+    if let Some(output_dir) = args.output {
+        println!("\n--- Extracting and organizing DICOM files ---");
+        extract_and_organize_dicoms(&arc_data, &deep_candidates, &output_dir)?;
+
+        // Export metadata to CSV
+        export_series_metadata_csv(&deep_candidates, &output_dir)?;
+    }
+
     Ok(())
 }

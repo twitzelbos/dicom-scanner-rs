@@ -143,7 +143,8 @@ When using `--mrn`:
 5. **Error Handling**: More descriptive error messages
 6. **Performance**: Streaming ZIP processing for very large archives
 
-## Recent Changes (2025-11-19)
+## Recent Changes
+### 2025-11-19
 1. **Added --mrn option**:
    - Extracts and outputs ONLY the Medical Record Number (Patient ID)
    - Absolutely no other output - no debug messages, no progress information
@@ -152,6 +153,42 @@ When using `--mrn`:
 2. **Improved error handling**:
    - Fixed crash when DICOM acquisition matrix values are malformed
    - Now returns "N/A" instead of panicking on invalid matrix data
+
+### 2026-02-02
+1. **Added --output option**:
+   - Extract and organize DICOM files by Study/Series hierarchy
+   - Uses descriptive folder names from DICOM metadata:
+     - Study folders: `Study_[StudyDescription]_[ShortUID]`
+     - Series folders: `Series_[Number]_[SeriesDescription]_[ShortUID]`
+   - Preserves original filenames
+   - Provides organization summary showing study/series structure
+
+2. **Added CSV metadata export**:
+   - Generates `series_metadata.csv` in the output directory
+   - One row per series with comprehensive metadata
+   - Includes spatial resolution, acquisition parameters, and timing information
+   - Tracks derived series relationships through DerivationDescription and ReferencedSeriesUID
+
+3. **Enhanced metadata extraction**:
+   - Added StudyDescription, ProtocolName extraction
+   - Added acquisition parameters: AcquisitionType (2D/3D), PixelSpacing, SliceThickness
+   - Added MR timing parameters: TR, TE, TI, AcquisitionTime
+   - Added MR technical parameters:
+     - FlipAngle: Flip angle in degrees
+     - NumberOfAverages: Signal averages (NEX)
+     - EchoTrainLength: ETL for FSE sequences
+     - ParallelImagingFactor: Acceleration factor with vendor support
+       * GE: ASSET factors from (0043,1083)
+       * Siemens: iPAT/GRAPPA from (0051,1011) and standard tags
+       * Standard DICOM: (0018,9069) and (0018,9078)
+     - MagneticFieldStrength: Field strength in Tesla
+   - Added image set information:
+     - SpacingBetweenSlices: Slice gap in mm
+     - ImageType: ORIGINAL/DERIVED classification
+   - Added AcquisitionDuration (protocol scan time) with fallback to GE private tag
+   - Added derivation tracking: DerivationDescription, ReferencedSeriesSequence
+   - Calculates FOV from pixel spacing and matrix size
+   - These fields are used for creating human-readable folder names and CSV export
 
 ## Notes
 - Project appears to be in active development
